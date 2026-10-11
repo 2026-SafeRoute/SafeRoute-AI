@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "raspberry-pi-congestion"
+version = "0.1.0"
+description = "SafeRoute Raspberry Pi edge congestion detection"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "pymodbus>=3.15,<4",
+]
+
+[project.optional-dependencies]
+onnx = ["onnxruntime>=1.16"]
+ultralytics = ["ultralytics>=8.0"]
+dev = ["pytest>=7.4", "pytest-mock>=3.12"]
+# hailo_platform은 PyPI 배포가 아니라 HailoRT 설치 패키지(.whl)로 제공되므로
+# requirements-pi.txt에서 별도 설치한다 (아래 README 참고).
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

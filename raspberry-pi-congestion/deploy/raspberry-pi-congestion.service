@@ -1,0 +1,21 @@
+[Unit]
+Description=SafeRoute Raspberry Pi Congestion Detector
+After=network-online.target systemd-time-wait-sync.service time-sync.target
+Wants=network-online.target systemd-time-wait-sync.service
+
+[Service]
+Type=simple
+User=pi
+# 경로는 Pi의 실제 클론 위치와 가상환경에 맞게 바꾼다.
+# 공용 .env와 device-configs/*.env는 작업 디렉터리 기준으로 프로그램이 직접 읽는다.
+WorkingDirectory=/home/pi/SafeRoute-AI/raspberry-pi-congestion
+# device-configs/*.env의 CCTV를 각각 독립 프로세스로 실행한다.
+ExecStart=/home/pi/SafeRoute-AI/raspberry-pi-congestion/.venv-hailo/bin/python -m raspberry_pi_congestion.multi_main rtsp
+# RTSP 재연결 한도를 넘기면 실패 코드로 종료한다. 어떤 이유로 끝나든 다시 띄운다.
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

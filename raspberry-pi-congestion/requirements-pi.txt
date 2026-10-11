@@ -1,0 +1,10 @@
+# Raspberry Pi 5 (Raspberry Pi OS 64-bit) 운영용.
+# hailo_platform(PyHailoRT)은 PyPI 의존성이 아니다. Hailo-8/8L AI Kit/AI HAT+는
+# Raspberry Pi OS의 hailo-all 패키지를 설치한다. 시스템 Python에 설치된 모듈을
+# 사용할 때는 venv를 --system-site-packages로 생성한다. Hailo-10H는 현재 미지원이다.
+# 장치/펌웨어/HailoRT/HEF 버전은 반드시 실기기에서 호환성을 확인할 것.
+numpy>=1.24
+opencv-python-headless>=4.8
+requests>=2.31
+python-dotenv>=1.0
+pymodbus>=3.15,<4

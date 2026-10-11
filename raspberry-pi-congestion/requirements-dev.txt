@@ -1,0 +1,10 @@
+# Windows / PyCharm 개발 PC용. ONNX CPU + 테스트까지 전부 포함.
+numpy>=1.24
+opencv-python>=4.8
+requests>=2.31
+onnxruntime>=1.16
+pytest>=7.4
+pytest-mock>=3.12
+python-dotenv>=1.0
+ultralytics>=8.0
+pymodbus>=3.15,<4

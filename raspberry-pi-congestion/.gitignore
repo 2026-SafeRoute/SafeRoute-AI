@@ -1,0 +1,55 @@
+# Local secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+device-configs/*.env
+
+# Virtual environments and IDE files
+.venv/
+.venv-*/
+venv/
+.idea/
+.vscode/
+
+# Python caches, packaging, tests, and coverage
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.pytest-tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+
+# Runtime state and logs
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+roi.json
+config/roi/*.json
+!config/roi/*.example.json
+
+# Local videos, model weights, and inference output
+sample_videos/*
+!sample_videos/.gitkeep
+models/*
+!models/.gitkeep
+runs/
+*.pt
+*.onnx
+*.hef
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini

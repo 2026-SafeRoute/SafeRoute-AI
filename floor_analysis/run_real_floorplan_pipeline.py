@@ -1,22 +1,32 @@
 """
 파인튜닝된 모델(unet_finetuned.pth)의 예측 결과를 그래프로 변환하는
-통합 테스트 스크립트
+통합 테스트 스크립트 (하이브리드 노드 방식).
 
 노드 생성 방식:
   - 방(room): 방 하나당 노드 1개만 생성 (벽에서 가장 먼 지점 = distance transform
-    최대 지점). ㄱ자/ㄷ자 방이어도 실제로 걸을 수 있는 위치를 보장
+    최대 지점). 단순 기하학적 중심이 아니라서 ㄱ자/ㄷ자 방이어도 실제로
+    걸을 수 있는 위치를 보장함.
   - 복도(corridor)/계단(stairs)/문(door): 기존 스켈레톤 방식 그대로 유지.
     복도를 따라 스켈레톤(중심선)을 뽑고, 분기점/끝점마다 노드를 만듦.
     문은 스켈레톤 노드 중 문 근처에 있는 노드에 is_door=True 속성으로 표시됨
-    (문 전용 노드를 따로 만들지 않음)
+    (문 전용 노드를 따로 만들지 않음 - 원래 방식과 동일).
   - 방 노드와 복도 그래프는, 각 문이 어느 방과 맞닿아 있는지를 계산해서
-    "방 중앙 노드 - 그 문에서 가장 가까운 복도 스켈레톤 노드"로 연결함.
+    "방 중앙 노드 <-> 그 문에서 가장 가까운 복도 스켈레톤 노드"로 연결함.
+
+- 출구(exit)는 지정하지 않으며, Dijkstra 대피경로 계산도 하지 않음.
 
 세그멘테이션 후처리:
   - 문(door) 예측 노이즈 제거 + 과대 예측된 문 덩어리 축소
   - 얇거나 끊긴 벽 보강
   - 복도(corridor)와 계단(stairs)을 space_type 속성으로 구분
 
+사전 준비:
+  - 이 파일을 finetune_local_floorplans.py, test_pipeline.py,
+    safe_route_cubicasa_training_pycharm.py 와 같은 폴더에 둘 것
+  - unet_finetuned.pth 가 같은 폴더에 있을 것
+
+실행:
+    python run_real_floorplan_pipeline.py --image_path finetune_data/images/5.png
 """
 
 import argparse
@@ -182,19 +192,19 @@ def densify_long_edges(G, max_edge_length=40):
     return G
 
 
-def merge_nearby_door_nodes(G, merge_radius=15):
+def merge_nearby_nodes(G, node_filter, merge_radius):
     """
-    같은 문 하나에 스켈레톤 노드가 여러 개 몰려서 is_door=True로 중복
-    표시되는 문제를 완화. merge_radius 안에 있는 문 노드들을 하나로 합치고,
-    합쳐지는 노드들이 갖고 있던 엣지는 전부 대표 노드로 재연결함.
+    node_filter(data) -> bool 조건을 만족하는 노드들 중, merge_radius 안에
+    가깝게 몰려있는 것들을 하나로 합침. 합쳐지는 노드들이 갖고 있던 엣지는
+    전부 대표 노드로 재연결함 (대표 노드 위치는 병합된 노드들의 평균 좌표).
     """
-    door_nodes = [n for n, d in G.nodes(data=True) if d.get("is_door")]
+    target_nodes = [n for n, d in G.nodes(data=True) if node_filter(d)]
 
     proximity = nx.Graph()
-    proximity.add_nodes_from(door_nodes)
-    for i in range(len(door_nodes)):
-        for j in range(i + 1, len(door_nodes)):
-            n1, n2 = door_nodes[i], door_nodes[j]
+    proximity.add_nodes_from(target_nodes)
+    for i in range(len(target_nodes)):
+        for j in range(i + 1, len(target_nodes)):
+            n1, n2 = target_nodes[i], target_nodes[j]
             d1, d2 = G.nodes[n1], G.nodes[n2]
             dist = ((d1["row"] - d2["row"]) ** 2 + (d1["col"] - d2["col"]) ** 2) ** 0.5
             if dist <= merge_radius:
@@ -224,6 +234,16 @@ def merge_nearby_door_nodes(G, merge_radius=15):
             merged_count += 1
 
     return G, merged_count
+
+
+def merge_nearby_door_nodes(G, merge_radius=15):
+    """같은 문 하나에 스켈레톤 노드가 여러 개 몰리는 문제를 완화."""
+    return merge_nearby_nodes(G, lambda d: d.get("is_door"), merge_radius)
+
+
+def merge_nearby_stairs_nodes(G, merge_radius=20):
+    """같은 계단 하나에 스켈레톤 노드가 여러 개 몰리는 문제를 완화."""
+    return merge_nearby_nodes(G, lambda d: d.get("space_type") == "stairs", merge_radius)
 
 
 def compute_door_connections(mask, room_labels):
@@ -456,7 +476,8 @@ def analyze_floorplan(
     image_path, model_path="unet_finetuned.pth", image_size=512,
     min_door_size=25, max_door_area=200, door_erode_iterations=2,
     wall_dilate=1, door_match_radius=15, min_room_size=100,
-    max_corridor_edge_length=40, door_merge_radius=15, device=None, model=None,
+    max_corridor_edge_length=40, door_merge_radius=15, stairs_merge_radius=20,
+    device=None, model=None, mode="rule", rule_node_spacing=30,
 ):
     """
     도면 이미지 하나를 받아서 최종 그래프(G)까지 만들어서 반환.
@@ -465,8 +486,34 @@ def analyze_floorplan(
     model을 미리 로딩해서 넘기면(FastAPI에서 매 요청마다 모델을 다시
     불러오지 않도록) 그걸 재사용하고, 안 넘기면 model_path로 새로 로딩함.
 
-    반환값: dict(G, mask, room_labels_only, skeleton, room_nodes)
+    mode="rule"(기본): rule_based_floorplan.py의 규칙 기반 분석 (벽선을 직접 읽음, 모델 미사용).
+        분석 중 예외가 나거나 노드를 하나도 찾지 못하면 아래 U-Net 방식으로 대체해서
+        항상 기존과 같은 형식의 결과를 돌려줌.
+    mode="unet": 기존 U-Net 세그멘테이션 기반 분석.
+    rule_node_spacing: 규칙 기반 방식의 복도 노드 간격 (image_size=512 기준 픽셀).
+
+    어느 방식이 실제로 쓰였는지는 반환값의 stats["mode"]에 기록됨
+    ("rule" / "unet" / "unet_fallback").
+
+    반환값: dict(G, mask, room_labels_only, skeleton, room_nodes, stats)
     """
+    analysis_mode = "unet"
+    if mode == "rule":
+        try:
+            from rule_based_floorplan import analyze_floorplan_rule_based
+            # rule_node_spacing은 image_size=512 기준 값. 요청의 image_size가 달라도
+            # 도면 대비 노드 간격(=노드 개수)이 같게 나오도록 비율을 맞춤.
+            rule_result = analyze_floorplan_rule_based(
+                image_path, image_size=image_size,
+                corridor_node_spacing=rule_node_spacing * image_size / 512,
+            )
+            if rule_result["G"].number_of_nodes() > 0:
+                return rule_result
+            print("경고: 규칙 기반 분석이 노드를 찾지 못해 U-Net 방식으로 대체합니다.")
+        except Exception as e:
+            print(f"경고: 규칙 기반 분석 실패 ({type(e).__name__}: {e}) - U-Net 방식으로 대체합니다.")
+        analysis_mode = "unet_fallback"
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -520,7 +567,8 @@ def analyze_floorplan(
     door_room_map = compute_door_room_touches(mask, room_labels_only)
     connect_rooms_to_corridor_graph(G, corridor_G, room_nodes, door_room_map)
 
-    G, merged_count = merge_nearby_door_nodes(G, merge_radius=door_merge_radius)
+    G, merged_door_count = merge_nearby_door_nodes(G, merge_radius=door_merge_radius)
+    G, merged_stairs_count = merge_nearby_stairs_nodes(G, merge_radius=stairs_merge_radius)
 
     return {
         "G": G,
@@ -529,12 +577,14 @@ def analyze_floorplan(
         "skeleton": skeleton,
         "room_nodes": room_nodes,
         "stats": {
+            "mode": analysis_mode,
             "total_doors": total_doors,
             "removed_doors": removed_doors,
             "shrunk_doors": num_shrunk,
             "num_rooms": num_rooms_only,
             "removed_small_rooms": removed_rooms,
-            "merged_door_nodes": merged_count,
+            "merged_door_nodes": merged_door_count,
+            "merged_stairs_nodes": merged_stairs_count,
         },
     }
 
@@ -542,6 +592,8 @@ def analyze_floorplan(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_path", type=str, required=True)
+    parser.add_argument("--mode", type=str, default="rule", choices=["rule", "unet"],
+                        help="rule: 벽선을 직접 읽는 규칙 기반 (기본) / unet: 학습된 U-Net 사용")
     parser.add_argument("--model_path", type=str, default="unet_finetuned.pth")
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--save_path", type=str, default="real_floorplan_pipeline_result.png")
@@ -561,6 +613,8 @@ def main():
                         help="복도 엣지가 이보다 길면 중간에 노드를 추가로 끼워 넣음")
     parser.add_argument("--door_merge_radius", type=int, default=15,
                         help="이 반경(픽셀) 안에 있는 문 노드들은 하나로 병합")
+    parser.add_argument("--stairs_merge_radius", type=int, default=20,
+                        help="이 반경(픽셀) 안에 있는 계단 노드들은 하나로 병합")
     parser.add_argument("--export_db", action="store_true",
                         help="완성된 그래프를 PostgreSQL에 저장 (db_export.py, schema.sql 필요)")
     parser.add_argument("--db_host", type=str, default="localhost")
@@ -581,8 +635,10 @@ def main():
         door_erode_iterations=args.door_erode_iterations, wall_dilate=args.wall_dilate,
         door_match_radius=args.door_match_radius, min_room_size=args.min_room_size,
         max_corridor_edge_length=args.max_corridor_edge_length,
-        door_merge_radius=args.door_merge_radius, device=device,
+        door_merge_radius=args.door_merge_radius, stairs_merge_radius=args.stairs_merge_radius,
+        device=device, mode=args.mode,
     )
+    print(f"   -> 분석 방식: {result['stats'].get('mode')}, 통계: {result['stats']}")
     G = result["G"]
     mask = result["mask"]
     room_labels_only = result["room_labels_only"]
@@ -602,6 +658,13 @@ def main():
 
     print("결과 시각화...")
     visualize_real(mask, room_labels_only, skeleton, room_nodes, G, save_path=args.save_path)
+
+    if result["stats"].get("mode") == "rule":
+        # 원본 도면 위에 방/문/복도 노드를 그린 검토용 그림 (원본 비율 그대로)
+        from rule_based_floorplan import save_overlay
+        overlay_path = os.path.splitext(args.save_path)[0] + "_overlay.png"
+        save_overlay(args.image_path, result, overlay_path)
+        print(f"검토용 오버레이 저장 완료: {os.path.abspath(overlay_path)}")
 
     if args.export_db:
         if not DB_EXPORT_AVAILABLE:

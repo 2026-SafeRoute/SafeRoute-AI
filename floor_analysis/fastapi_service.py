@@ -44,6 +44,13 @@ MODEL_PATH = os.environ.get("SAFEROUTE_MODEL_PATH", "unet_finetuned.pth")
 S3_BUCKET = os.environ.get("SAFEROUTE_S3_BUCKET")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# 도면 분석 방식: "rule"(기본, 벽선을 직접 읽는 규칙 기반) / "unet"(기존 U-Net 방식).
+# 문제가 생기면 코드 수정 없이 SAFEROUTE_ANALYSIS_MODE=unet 으로 기존 방식으로 되돌릴 수 있음.
+ANALYSIS_MODE = os.environ.get("SAFEROUTE_ANALYSIS_MODE", "rule").strip().lower()
+if ANALYSIS_MODE not in ("rule", "unet"):
+    print(f"경고: SAFEROUTE_ANALYSIS_MODE 값이 올바르지 않아 'rule'을 사용합니다. (입력값: {ANALYSIS_MODE})")
+    ANALYSIS_MODE = "rule"
+
 _model = None
 _s3_client = None
 
@@ -72,7 +79,20 @@ def download_image_from_s3(image_key: str) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"S3에서 이미지를 찾을 수 없습니다 (key={image_key}): {e}")
     buf.seek(0)
-    return Image.open(buf).convert("RGB")
+    return to_rgb_on_white(Image.open(buf))
+
+
+def to_rgb_on_white(image: Image.Image) -> Image.Image:
+    """
+    투명 배경이 있는 이미지(PNG 등)를 흰 배경 위에 합성해서 RGB로 변환.
+    그냥 convert("RGB")를 하면 투명한 부분이 검은색이 되는데, 도면 분석은
+    검은색을 벽으로 읽기 때문에 결과가 완전히 틀어짐.
+    """
+    if image.mode in ("RGBA", "LA", "P"):
+        image = image.convert("RGBA")
+        background = Image.new("RGBA", image.size, (255, 255, 255, 255))
+        image = Image.alpha_composite(background, image)
+    return image.convert("RGB")
 
 
 # ------------------------------------------------------------
@@ -129,7 +149,7 @@ def analyze_floorplan_endpoint(req: AnalyzeRequest):
 
     try:
         result = analyze_floorplan(
-            tmp_path, model=_model, device=DEVICE, image_size=req.image_size
+            tmp_path, model=_model, device=DEVICE, image_size=req.image_size, mode=ANALYSIS_MODE
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"도면 분석 중 오류: {e}")
@@ -170,7 +190,7 @@ def analyze_floorplan_endpoint(req: AnalyzeRequest):
         dr = G.nodes[u]["row"] - G.nodes[v]["row"]
         dc = G.nodes[u]["col"] - G.nodes[v]["col"]
         distance_m = math.sqrt((dc * width_scale) ** 2 + (dr * height_scale) ** 2)
-        if distance_m <= 0:
+        if round(distance_m, 3) <= 0:  # 반올림 후 0.000이 되는 경우도 포함 (BE는 0 이하 거리를 거부함)
             distance_m = 0.01
         edges_out.append(
             EdgeOut(
@@ -201,6 +221,7 @@ def health():
         "status": "ok",
         "device": str(DEVICE),
         "model_loaded": _model is not None,
+        "analysis_mode": ANALYSIS_MODE,
         "bucket": S3_BUCKET,
         "bucket_accessible": s3_ok,
     }
@@ -227,7 +248,8 @@ if os.environ.get("ENABLE_LOCAL_TEST", "false").lower() == "true":
 
         try:
             result = analyze_floorplan(
-                req.local_image_path, model=_model, device=DEVICE, image_size=req.image_size
+                req.local_image_path, model=_model, device=DEVICE, image_size=req.image_size,
+                mode=ANALYSIS_MODE,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"도면 분석 중 오류: {e}")
@@ -258,7 +280,7 @@ if os.environ.get("ENABLE_LOCAL_TEST", "false").lower() == "true":
             dr = G.nodes[u]["row"] - G.nodes[v]["row"]
             dc = G.nodes[u]["col"] - G.nodes[v]["col"]
             distance_m = math.sqrt((dc * width_scale) ** 2 + (dr * height_scale) ** 2)
-            if distance_m <= 0:
+            if round(distance_m, 3) <= 0:  # 반올림 후 0.000이 되는 경우도 포함 (BE는 0 이하 거리를 거부함)
                 distance_m = 0.01
             edges_out.append(EdgeOut(
                 from_temp_id=str(u), to_temp_id=str(v),

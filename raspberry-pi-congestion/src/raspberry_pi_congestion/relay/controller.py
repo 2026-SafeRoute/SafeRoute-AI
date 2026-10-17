@@ -54,9 +54,20 @@ Safe Route 프로젝트 - 라즈베리파이 엣지에서 좌/우 유도등(스�
 2. 통신 장애(연결 실패/타임아웃/에러 응답) 발생 시 즉시 fail-safe로 전환한다.
    - 상태 캐시를 UNKNOWN(None)으로 내려 "모르면 ON이라고 말하지 않는다"를
      보장하고,
-   - 두 채널 모두에 OFF 명령을 best-effort로 재전송을 시도한다.
+   - 두 채널 모두에 코일 OFF(무전류) 명령을 best-effort로 재전송을 시도한다.
+     (active_low=False면 이것이 곧 유도등 소등이고, active_low=True면
+     NC 접점이라 유도등 점등 상태다 - 비상등은 점등 쪽이 안전하다.)
    - 이 재전송까지 실패하면 상태는 UNKNOWN으로 남지만, 절대 ON으로
      보고하지 않는다.
+
+릴레이 극성 반전 (active_low)
+--------------------------------------------
+유도등이 릴레이의 NC(상시닫힘) 접점에 배선되어 있으면 극성이 반대다:
+코일 OFF = 유도등 점등, 코일 ON = 유도등 소등. 이때 active_low=True로
+생성하면 이 클래스의 논리 상태(is_on/turn_on/turn_off/both_on/all_off/
+switch_to)는 "유도등 점등 여부"를 그대로 의미하고, 실제 코일에는 반전된
+값(논리 ON -> 코일 OFF)이 전송된다. 이 클래스 밖에서는 극성을 신경 쓸
+필요가 없다. NO 접점에 배선했다면 기본값(active_low=False)을 쓴다.
 """
 
 from __future__ import annotations
@@ -126,10 +137,13 @@ class RelayController:
         timeout: float = 3.0,
         retries: int = 1,
         client: Optional[ModbusTcpClient] = None,
+        active_low: bool = False,
     ) -> None:
         self._host = host
         self._port = port
         self._device_id = device_id
+        # True면 유도등이 NC 접점에 배선되어 코일 OFF일 때 점등된다 (모듈 docstring 참고).
+        self._active_low = active_low
         self._coil_map = coil_map or RelayCoilMap()
         self._lock = threading.RLock()
         # 테스트에서는 pymodbus 대신 fake/mock 클라이언트를 주입할 수 있다 (DI).
@@ -238,6 +252,14 @@ class RelayController:
     def _other_channel(channel: RelayChannel) -> RelayChannel:
         return RelayChannel.CH2 if channel is RelayChannel.CH1 else RelayChannel.CH1
 
+    def _to_coil(self, on: bool) -> bool:
+        """논리 상태(유도등 점등 여부)를 실제 코일 값으로 변환한다."""
+        return (not on) if self._active_low else on
+
+    def _from_coil(self, coil: bool) -> bool:
+        """실제 코일 값을 논리 상태(유도등 점등 여부)로 변환한다."""
+        return (not coil) if self._active_low else coil
+
     def _read_channel(self, channel: RelayChannel) -> bool:
         """실기기에서 채널 상태를 읽는다. 실패 시 fail-safe로 전환 후 예외를 던진다."""
         address = self._coil_map.coil_for(channel)
@@ -254,7 +276,7 @@ class RelayController:
             self._enter_fail_safe()
             raise RelayCommunicationError(str(exc)) from exc
         else:
-            state = bool(result.bits[0])
+            state = self._from_coil(bool(result.bits[0]))
             self._state[channel] = state
             self._healthy = True
             return state
@@ -262,12 +284,13 @@ class RelayController:
     def _write_channel(self, channel: RelayChannel, on: bool) -> None:
         """실기기에 채널 ON/OFF 명령을 보낸다. 실패 시 fail-safe로 전환 후 예외를 던진다."""
         address = self._coil_map.coil_for(channel)
+        coil = self._to_coil(on)
         try:
             if not self._client.connect():
                 raise RelayCommunicationError(f"{self._host}:{self._port} 연결 실패")
-            result = self._client.write_coil(address, on, device_id=self._device_id)
+            result = self._client.write_coil(address, coil, device_id=self._device_id)
             if result.isError():
-                raise RelayCommunicationError(f"write_coil({address}, {on}) 실패: {result}")
+                raise RelayCommunicationError(f"write_coil({address}, {coil}) 실패: {result}")
         except RelayCommunicationError:
             self._enter_fail_safe()
             raise
@@ -283,8 +306,10 @@ class RelayController:
 
         1) 상태를 UNKNOWN(None)으로 내려, 실패 이후 확인되지 않은 상태를
            절대 ON으로 잘못 보고하지 않게 한다.
-        2) 두 채널 모두에 OFF 명령을 best-effort로 재시도한다. 이 재시도
-           자체가 실패해도 (1)에서 이미 UNKNOWN으로 내렸으므로 안전하다.
+        2) 두 채널 모두에 코일 OFF(무전류) 명령을 best-effort로 재시도한다.
+           active_low=True(NC 배선)에서는 이것이 유도등 점등이라 논리 상태도
+           그에 맞게(ON) 기록된다. 이 재시도 자체가 실패해도 (1)에서 이미
+           UNKNOWN으로 내렸으므로 안전하다.
         재귀적으로 다시 실패 처리에 빠지지 않도록 _write_channel/_read_channel을
         거치지 않고 클라이언트를 직접 호출한다.
         """
@@ -300,6 +325,6 @@ class RelayController:
                     continue
                 result = self._client.write_coil(address, False, device_id=self._device_id)
                 if not result.isError():
-                    self._state[ch] = False
+                    self._state[ch] = self._from_coil(False)
             except Exception:  # noqa: BLE001 - fail-safe 경로는 어떤 예외에도 죽으면 안 된다
                 logger.exception("fail-safe OFF 재시도 중 추가 오류 (channel=%s)", ch)

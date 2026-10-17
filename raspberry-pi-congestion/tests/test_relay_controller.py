@@ -277,3 +277,103 @@ def test_all_off는_두_채널_모두_끈다():
     assert controller.is_on(RelayChannel.CH2) is False
     assert client.coil_states[0] is False
     assert client.coil_states[1] is False
+
+
+# === 극성 반전 (active_low): 유도등이 NC 접점에 배선된 경우 코일 OFF = 점등 ===
+
+
+def make_inverted_controller(client: FakeModbusClient) -> RelayController:
+    return RelayController(host="127.0.0.1", port=15020, client=client, active_low=True)
+
+
+def test_active_low에서_turn_on은_코일_OFF를_보내고_논리상태는_ON이다():
+    client = FakeModbusClient(coil_states={0: True, 1: True})  # 코일 ON = 소등 = 논리 OFF
+    controller = make_inverted_controller(client)
+
+    controller.turn_on(RelayChannel.CH1)
+
+    assert (0, False) in client.write_calls
+    assert client.coil_states[0] is False
+    assert controller.is_on(RelayChannel.CH1) is True
+
+
+def test_active_low에서_turn_off는_코일_ON을_보내고_논리상태는_OFF다():
+    client = FakeModbusClient(coil_states={0: False, 1: True})
+    controller = make_inverted_controller(client)
+
+    controller.turn_off(RelayChannel.CH1)
+
+    assert (0, True) in client.write_calls
+    assert client.coil_states[0] is True
+    assert controller.is_on(RelayChannel.CH1) is False
+
+
+def test_active_low에서_both_on은_두_코일을_모두_OFF로_보낸다():
+    client = FakeModbusClient(coil_states={0: True, 1: True})
+    controller = make_inverted_controller(client)
+
+    controller.both_on()
+
+    assert client.coil_states == {0: False, 1: False}
+    assert controller.is_on(RelayChannel.CH1) is True
+    assert controller.is_on(RelayChannel.CH2) is True
+
+
+def test_active_low에서_all_off는_두_코일을_모두_ON으로_보낸다():
+    client = FakeModbusClient(coil_states={0: False, 1: False})
+    controller = make_inverted_controller(client)
+
+    controller.all_off()
+
+    assert client.coil_states == {0: True, 1: True}
+    assert controller.is_on(RelayChannel.CH1) is False
+    assert controller.is_on(RelayChannel.CH2) is False
+
+
+def test_active_low에서_switch_to는_대상만_점등한다():
+    # given: CH1 점등 중(코일 OFF), CH2 소등 중(코일 ON)
+    client = FakeModbusClient(coil_states={0: False, 1: True})
+    controller = make_inverted_controller(client)
+
+    controller.switch_to(RelayChannel.CH2)
+
+    # then: CH1 소등(코일 ON), CH2 점등(코일 OFF)
+    assert client.coil_states == {0: True, 1: False}
+    assert controller.is_on(RelayChannel.CH1) is False
+    assert controller.is_on(RelayChannel.CH2) is True
+
+
+def test_active_low에서_refresh_status는_코일값을_반전해서_논리상태로_읽는다():
+    client = FakeModbusClient(coil_states={0: False, 1: True})
+    controller = make_inverted_controller(client)
+
+    controller.refresh_status()
+
+    assert controller.is_on(RelayChannel.CH1) is True   # 코일 OFF = 점등
+    assert controller.is_on(RelayChannel.CH2) is False  # 코일 ON = 소등
+
+
+def test_active_low에서도_반대_채널이_점등_중이면_turn_on을_거부한다():
+    # given: CH1 점등 중 (코일 OFF), CH2 소등 중 (코일 ON)
+    client = FakeModbusClient(coil_states={0: False, 1: True})
+    controller = make_inverted_controller(client)
+
+    with pytest.raises(BothChannelsOnError):
+        controller.turn_on(RelayChannel.CH2)
+
+    assert (1, False) not in client.write_calls
+
+
+def test_active_low에서_통신_실패_시_fail_safe는_코일_OFF를_보내_점등_상태가_된다():
+    # given: 최초 명령 1회만 실패하고 이후(재시도)는 성공
+    client = FakeModbusClient(coil_states={0: True, 1: True}, fail_at={1})
+    controller = make_inverted_controller(client)
+
+    with pytest.raises(RelayCommunicationError):
+        controller.turn_off(RelayChannel.CH1)
+
+    # then: fail-safe는 두 코일을 모두 OFF(무전류)로 둔다 = NC 배선에서는 양쪽 점등
+    assert client.coil_states == {0: False, 1: False}
+    assert controller.is_on(RelayChannel.CH1) is True
+    assert controller.is_on(RelayChannel.CH2) is True
+    assert controller.healthy is False

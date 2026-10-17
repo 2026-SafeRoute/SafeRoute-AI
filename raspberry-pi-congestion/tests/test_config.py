@@ -113,6 +113,23 @@ def test_relay_host_and_port_are_parsed():
     assert config.relay_host == "192.168.0.81"
     assert config.relay_port == 5000
     assert config.relay_poll_interval_sec == 2
+    # NC 배선 옵션은 명시하지 않으면 꺼져 있다 (기본 = NO 배선, 코일 ON = 점등)
+    assert config.relay_active_low is False
+
+
+def test_relay_active_low_can_be_enabled():
+    config = AppConfig.from_env(
+        {
+            "RUN_MODE": "dry-run",
+            "VIDEO_SOURCE": "./sample_videos/test.mp4",
+            "CCTV_CODE": "CCTV_001",
+            "RELAY_HOST": "192.168.0.241",
+            "RELAY_PORT": "4196",
+            "RELAY_ACTIVE_LOW": "true",
+        }
+    )
+
+    assert config.relay_active_low is True
 
 
 def test_relay_host_without_port_raises():

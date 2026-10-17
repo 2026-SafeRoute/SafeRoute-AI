@@ -131,6 +131,51 @@ def test_both_on이_매뉴얼의_릴레이0_ON_릴레이1_ON_명령과_일치한
     assert server.received == [MANUAL_CH1_ON, MANUAL_CH2_ON]
 
 
+def test_active_low에서_both_on은_매뉴얼의_릴레이0_OFF_릴레이1_OFF_명령을_보낸다():
+    server = _RecordingServer()
+    server.start()
+    controller = RelayController(host="127.0.0.1", port=server.port, timeout=2, active_low=True)
+
+    try:
+        controller.both_on()
+    finally:
+        controller.close()
+        server.stop()
+
+    # NC 배선: 양쪽 점등 = 두 코일 OFF
+    assert server.received == [MANUAL_CH1_OFF, MANUAL_CH2_OFF]
+
+
+def test_active_low에서_all_off는_매뉴얼의_릴레이0_ON_릴레이1_ON_명령을_보낸다():
+    server = _RecordingServer()
+    server.start()
+    controller = RelayController(host="127.0.0.1", port=server.port, timeout=2, active_low=True)
+
+    try:
+        controller.all_off()
+    finally:
+        controller.close()
+        server.stop()
+
+    # NC 배선: 양쪽 소등 = 두 코일 ON
+    assert server.received == [MANUAL_CH1_ON, MANUAL_CH2_ON]
+
+
+def test_active_low에서_switch_to_CH2는_CH1_코일_ON_CH2_코일_OFF를_보낸다():
+    server = _RecordingServer()
+    server.start()
+    controller = RelayController(host="127.0.0.1", port=server.port, timeout=2, active_low=True)
+
+    try:
+        controller.switch_to(RelayChannel.CH2)
+    finally:
+        controller.close()
+        server.stop()
+
+    # NC 배선: CH1 소등 = 코일 ON, CH2 점등 = 코일 OFF
+    assert server.received == [MANUAL_CH1_ON, MANUAL_CH2_OFF]
+
+
 def test_상태_조회가_매뉴얼의_릴레이0_상태_읽기_명령과_일치한다():
     server = _RecordingServer()
     server.start()

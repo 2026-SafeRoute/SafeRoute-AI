@@ -27,12 +27,12 @@ class Detection:
     class_id: int = 0
     class_name: str = "person"
 
-    def bottom_center(self, frame_width: int, frame_height: int) -> Point:
+    def center(self, frame_width: int, frame_height: int) -> Point:
         if frame_width <= 0 or frame_height <= 0:
             raise ValueError("frame dimensions must be positive")
         return Point(
             max(0.0, min(1.0, ((self.x1 + self.x2) / 2.0) / frame_width)),
-            max(0.0, min(1.0, self.y2 / frame_height)),
+            max(0.0, min(1.0, ((self.y1 + self.y2) / 2.0) / frame_height)),
         )
 
 

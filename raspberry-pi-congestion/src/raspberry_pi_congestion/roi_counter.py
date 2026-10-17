@@ -6,7 +6,7 @@ from .models import Detection, Point
 
 
 class RoiCounter:
-    """ROI 안의 사람만 센다. ROI를 설정하지 않으면 화면 전체의 사람을 센다."""
+    """박스 중심점이 ROI 안에 있는 사람만 센다. ROI를 설정하지 않으면 화면 전체의 사람을 센다."""
 
     def __init__(self, roi: Optional[Sequence[Point]] = None) -> None:
         if roi is not None and len(roi) < 3:
@@ -19,7 +19,7 @@ class RoiCounter:
     def filter_inside(self, detections: Sequence[Detection], frame_width: int, frame_height: int) -> list[Detection]:
         if not self.roi:
             return list(detections)
-        return [d for d in detections if self._point_in_polygon(d.bottom_center(frame_width, frame_height), self.roi)]
+        return [d for d in detections if self._point_in_polygon(d.center(frame_width, frame_height), self.roi)]
 
     @staticmethod
     def _point_in_polygon(point: Point, polygon: Sequence[Point], epsilon: float = 1e-9) -> bool:

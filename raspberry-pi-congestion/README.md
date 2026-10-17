@@ -186,6 +186,9 @@ python -m raspberry_pi_congestion.main dry-run
 CCTV별 파일로 저장한 뒤 `ROI_CONFIG_PATH`에 그 경로를 지정한다. `setup-roi`는
 `ROI_CONFIG_PATH`가 없으면 `./config/roi/{CCTV_CODE}.json`에 저장한다.
 
+ROI 안/밖은 검출 박스의 중심점으로 판정한다. 박스가 ROI와 겹쳐도 중심점이 ROI 밖이면 집계하지
+않으므로, ROI는 사람의 몸통이 들어올 영역을 기준으로 그린다.
+
 ```powershell
 python -m raspberry_pi_congestion.main setup-roi
 ```

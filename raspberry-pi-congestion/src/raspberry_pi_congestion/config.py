@@ -43,6 +43,7 @@ class AppConfig:
     log_level: str
     relay_host: Optional[str]
     relay_port: Optional[int]
+    relay_active_low: bool
     relay_poll_interval_sec: float
     monitoring_jpeg_quality: int
     monitoring_image_max_width: int
@@ -119,6 +120,8 @@ class AppConfig:
             show_preview=boolean("SHOW_PREVIEW", False),
             log_level=e.get("LOG_LEVEL", "INFO"),
             relay_host=relay_host, relay_port=relay_port,
+            # 유도등이 릴레이 NC 접점에 배선되어 코일 OFF일 때 점등되면 true (기본 false = NO 배선).
+            relay_active_low=boolean("RELAY_ACTIVE_LOW", False),
             relay_poll_interval_sec=positive_float("RELAY_POLL_INTERVAL_SEC", "2"),
             monitoring_jpeg_quality=monitoring_jpeg_quality,
             monitoring_image_max_width=positive_int("MONITORING_IMAGE_MAX_WIDTH", "960"),

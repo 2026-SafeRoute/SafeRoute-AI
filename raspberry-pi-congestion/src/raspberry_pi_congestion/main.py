@@ -38,7 +38,9 @@ def _start_light_command_executor(config: AppConfig, device_client: SafeRouteDev
     실패해도 혼잡도 감지 자체는 계속 돼야 한다 - 여기서 예외를 흡수한다.
     """
     try:
-        relay = RelayController(host=config.relay_host, port=config.relay_port)
+        relay = RelayController(
+            host=config.relay_host, port=config.relay_port, active_low=config.relay_active_low
+        )
         relay.refresh_status()
     except RelayControllerError as exc:
         logger.warning("릴레이 초기화 실패 - 유도등 명령 폴링 없이 계속 진행: %s", exc)
@@ -51,8 +53,9 @@ def _start_light_command_executor(config: AppConfig, device_client: SafeRouteDev
         daemon=True,
     )
     thread.start()
-    logger.info("유도등 명령 폴링 시작: host=%s, port=%s, interval=%ss",
-                config.relay_host, config.relay_port, config.relay_poll_interval_sec)
+    logger.info("유도등 명령 폴링 시작: host=%s, port=%s, active_low=%s, interval=%ss",
+                config.relay_host, config.relay_port, config.relay_active_low,
+                config.relay_poll_interval_sec)
 
 
 def main(argv=None) -> int:

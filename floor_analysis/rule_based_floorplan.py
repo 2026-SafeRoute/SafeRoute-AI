@@ -1,22 +1,6 @@
 """
-규칙 기반 도면 분석 (U-Net 없이 벽선을 직접 읽는 방식)
-
-흰 배경에 검은 벽선이 깨끗하게 그려진 도면이 대상.
-학습 데이터가 적어 U-Net이 이런 도면의 벽을 제대로 예측하지 못하는 문제를
-피하기 위해, 벽을 "예측"하지 않고 이미지에서 그대로 읽는다.
-
-처리 순서:
-  1) 굵은 검은 선 = 벽. 글자/기호(작은 덩어리)와 얇은 선(문 호, 계단 빗금)은 제외
-  2) 건물 바깥 제외 (테두리와 이어진 빈 공간)
-  3) 내부 빈 공간을 distance transform + watershed로 분할 -> 좁은 목(문 틈)에서 나뉨
-  4) 넓게 맞닿은 영역끼리는 다시 합침 (문이 아니라 그냥 트인 공간)
-  5) 남은 접촉 구간 하나하나 = 문
-  6) 문이 많은 영역 = 복도, 빗금이 많은 영역 = 계단, 나머지 = 방
-  7) 방/계단은 중심 노드 1개, 복도는 중심선을 따라 일정 간격으로 노드 생성
-
-analyze_floorplan_rule_based()는 run_real_floorplan_pipeline.analyze_floorplan()과
-같은 형식(dict: G, mask, room_labels_only, skeleton, room_nodes, stats)으로 반환하고,
-노드 좌표도 같은 기준(image_size x image_size 정사각)으로 맞춘다.
+규칙 기반 도면 분석. 벽선을 직접 읽어 방/복도/문/계단을 나눈다.
+흰 배경에 검은 선으로 그린 도면용. 반환 형식은 run_real_floorplan_pipeline.analyze_floorplan과 같다.
 """
 
 import numpy as np
@@ -32,7 +16,7 @@ EIGHT = np.ones((3, 3), dtype=int)
 
 
 def _load_rgb(image_path):
-    """투명 배경(RGBA)은 흰색 위에 합성해서 읽음."""
+    """투명 배경은 흰색 위에 합성해서 읽는다."""
     img = Image.open(image_path)
     if img.mode in ("RGBA", "LA", "P"):
         img = img.convert("RGBA")
@@ -42,7 +26,7 @@ def _load_rgb(image_path):
 
 
 def _small_blobs(dark, max_dim):
-    """글자/기호처럼 벽과 떨어져 있는 작은 덩어리 마스크와 그 중심 좌표들."""
+    """글자/기호 크기의 작은 덩어리 마스크와 중심 좌표."""
     lab, _ = ndimage.label(dark, structure=EIGHT)
     blobs = np.zeros_like(dark)
     centers = []
@@ -55,11 +39,7 @@ def _small_blobs(dark, max_dim):
 
 
 def _number_label_centers(text, w, labels):
-    """
-    방 번호처럼 글자 여러 개가 가로로 붙어 있는 묶음의 중심 좌표.
-    글자 하나짜리(기호, 아이콘)는 제외. 벽 너머 옆방 번호와 한 묶음이 되지 않도록
-    같은 영역(labels) 안의 글자끼리만 묶음.
-    """
+    """같은 영역 안에서 가로로 붙은 글자 묶음(방 번호)의 중심. 글자 하나짜리는 제외."""
     glyphs, n = ndimage.label(text, structure=EIGHT)
     if n == 0:
         return []
@@ -75,10 +55,7 @@ def _number_label_centers(text, w, labels):
 
 
 def _hatch_mask(lines, w, min_transitions=6):
-    """
-    계단 빗금처럼 평행선이 촘촘한 구역. 선 굵기와 무관하게, 일정 길이 구간 안에서
-    선을 몇 번 넘나드는지(전환 횟수)로 판정.
-    """
+    """계단 빗금처럼 짧은 구간에 평행선이 촘촘한 영역."""
     L = max(9, round(0.03 * w))
     side = max(3, L // 3)
     v = np.abs(np.diff(lines.astype(np.int8), axis=0, prepend=0)).astype(np.float32)
@@ -98,7 +75,7 @@ def _hatch_mask(lines, w, min_transitions=6):
 
 
 def _find_contacts(labels):
-    """서로 다른 영역이 직접 맞닿은 구간들. 구간 하나 = {pair, pts, length}."""
+    """서로 다른 영역이 맞닿은 구간 목록. 구간 = {pair, pts, length}."""
     h, w = labels.shape
     n = int(labels.max()) + 1
     key = np.zeros((h, w), dtype=np.int64)
@@ -125,9 +102,8 @@ def _find_contacts(labels):
 
 def _merge_regions(labels, segments, region_width, open_ratio, min_area, protected, locked=()):
     """
-    접촉 폭이 영역 자체의 폭에 가까우면(문이 아니라 그냥 트인 공간) 합치고,
-    너무 작은 조각은 가장 길게 맞닿은 이웃에 흡수. 이웃이 없는 작은 조각은 버림.
-    문은 방보다 훨씬 좁고, 복도가 꺾이거나 넓어지는 지점은 복도 폭만큼 넓다는 점을 이용.
+    접촉 폭이 영역 폭에 가까우면(문이 아니라 트인 공간) 합치고, 작은 조각은 가장 길게 닿은 이웃에 붙인다.
+    protected/locked 영역은 합치지 않는다.
     """
     n = int(labels.max()) + 1
     parent = list(range(n))
@@ -143,7 +119,7 @@ def _merge_regions(labels, segments, region_width, open_ratio, min_area, protect
         narrow_id = p if region_width[p] <= region_width[q] else q
         narrower = region_width[narrow_id]
         if protected[narrow_id] or p in locked or q in locked:
-            continue  # 번호가 적힌 방: 문이 방 폭만큼 넓어도 복도와 합치지 않음
+            continue
         if narrower > 0 and s["length"] / narrower >= open_ratio:
             a, b = find(s["pair"][0]), find(s["pair"][1])
             if a != b:
@@ -193,7 +169,7 @@ def _merge_regions(labels, segments, region_width, open_ratio, min_area, protect
 
 
 def _prune_leaf_chains(G, min_len):
-    """끝점에서 분기점까지의 짧은 가지를 한 번만 제거 (연쇄적으로 깎아먹지 않도록 단일 패스)."""
+    """분기점에 붙은 min_len 미만의 가지를 한 번 제거."""
     to_remove = []
     for leaf in [n for n, d in G.degree() if d == 1]:
         path, length, prev, cur = [leaf], 0.0, None, leaf
@@ -213,10 +189,7 @@ def _prune_leaf_chains(G, min_len):
 
 
 def _corridor_centerline_nodes(region, dist, spacing):
-    """
-    복도 영역의 중심선을 따라 일정 간격으로 노드를 배치.
-    반환: (nodes: [(row, col)], edges: [(i, j)], skeleton_pixels: (N,2))
-    """
+    """복도 중심선을 따라 spacing 간격으로 노드를 놓는다. (nodes, edges, skeleton_pixels) 반환."""
     sk = skeletonize(region)
     if sk.sum() < 2:
         r, c = np.unravel_index(np.argmax(np.where(region, dist, -1)), region.shape)
@@ -227,7 +200,7 @@ def _corridor_centerline_nodes(region, dist, spacing):
     _prune_leaf_chains(raw, min_len=2.2 * half_width)
 
     keys = {n for n, d in raw.degree() if d != 2}
-    if not keys:  # 분기도 끝점도 없는 순환 고리
+    if not keys:
         keys = {next(iter(raw.nodes))}
 
     nodes, edges = [], []
@@ -235,7 +208,7 @@ def _corridor_centerline_nodes(region, dist, spacing):
     for cluster in nx.connected_components(raw.subgraph(keys)):
         pts = np.array(list(cluster), dtype=float)
         center = pts.mean(axis=0)
-        r, c = pts[np.argmin(((pts - center) ** 2).sum(axis=1))]  # 중심선 위 픽셀로 스냅
+        r, c = pts[np.argmin(((pts - center) ** 2).sum(axis=1))]
         idx = len(nodes)
         nodes.append((float(r), float(c)))
         for p in cluster:
@@ -277,16 +250,12 @@ def _corridor_centerline_nodes(region, dist, spacing):
 
 def analyze_floorplan_rule_based(
     image_path, image_size=512, dark_thresh=128, wall_open=0,
-open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
+    open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
     min_region_frac=0.0004, stairs_min_frac=0.25, exterior_max_frac=0.15, hatch_contrast=18, max_side=2400,
 ):
     """
-    wall_open: 벽으로 인정할 최소 선 굵기(픽셀). 0이면 이미지 폭에 맞춰 자동.
-    open_merge_ratio: 접촉 폭이 (더 좁은 쪽 영역 폭 x 이 값) 이상이면 문이 아니라 트인 공간으로 보고 합침.
-    corridor_min_doors: 문이 이 개수 이상 달린 영역을 복도로 판정.
-    corridor_node_spacing: 복도 노드 간격 (image_size 기준 픽셀).
-    max_side: 이미지의 긴 변이 이보다 크면 줄여서 분석 (처리 시간 제한용).
-              노드 좌표는 image_size 기준으로 정규화되므로 결과 좌표에는 영향 없음.
+    wall_open: 벽으로 볼 최소 선 굵기(0이면 자동). open_merge_ratio: 이 비율 이상 트인 접촉은 합침.
+    corridor_min_doors: 문이 이 개수 이상이면 복도. max_side: 긴 변이 이보다 크면 줄여서 분석.
     """
     rgb = _load_rgb(image_path)
     if max_side and max(rgb.shape[:2]) > max_side:
@@ -298,11 +267,10 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
     gray = rgb.astype(np.int16).mean(axis=2)
     dark = gray < dark_thresh
 
-    # ---- 1) 벽 추출 ----
+    # 벽 추출
     text, text_centers = _small_blobs(dark, max_dim=0.04 * w)
     lines = dark & ~text
-    # 계단 빗금은 분홍/회색처럼 연한 선으로 그려진 경우가 있어서, 절대 밝기가 아니라
-    # 주변 평균보다 얼마나 어두운지로 선을 잡음 (바닥색이 칠해진 방은 대비가 없어 걸리지 않음)
+    # 빗금은 연한 선일 수 있어 주변 대비로 잡는다
     win = max(5, round(0.012 * w)) | 1
     local_dark = (ndimage.uniform_filter(gray.astype(np.float32), size=win) - gray) > hatch_contrast
     hatch = _hatch_mask(local_dark & ~text, w)
@@ -314,7 +282,7 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
         if max(slc[0].stop - slc[0].start, slc[1].stop - slc[1].start) < 0.04 * w:
             wall[slc][wall_lab[slc] == i] = False
 
-    # ---- 2) 건물 바깥 제외 (얇은 선까지 포함해서 판정: 넓은 외부 출입문으로 새는 것 방지) ----
+    # 건물 바깥 (얇은 선까지 포함해 테두리에서 flood fill)
     closed_lines = ndimage.binary_closing(dark, structure=EIGHT)
     out_lab, _ = ndimage.label(~closed_lines)
     border = np.unique(np.concatenate([out_lab[0], out_lab[-1], out_lab[:, 0], out_lab[:, -1]]))
@@ -322,14 +290,12 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
     outside = ndimage.binary_dilation(outside, iterations=2)
     free = ~wall & ~outside
 
-    # ---- 3) watershed 분할 ----
+    # watershed 분할
     dist = ndimage.distance_transform_edt(free)
     markers, _ = ndimage.label(h_maxima(dist, max(2.0, 0.004 * w)))
     labels = watershed(-dist, markers, mask=free).astype(np.int32)
 
-    # ---- 3-1) 복도 쪽이 넓게 트인 방 살리기 ----
-    # 벽 모양만으로는 복도와 구분되지 않는 방이 있음. 문이 많이 달린 영역(복도) 안에
-    # 방 번호가 있으면, 그 근처에서 벽에서 가장 먼 지점을 씨앗으로 추가해서 다시 분할.
+    # 복도로 묶인 영역 안에 방 번호가 있으면 그 자리를 씨앗으로 추가해 다시 나눈다
     segments = _find_contacts(labels)
     contact_count = np.zeros(int(labels.max()) + 1, dtype=int)
     for s in segments:
@@ -357,7 +323,7 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
         segments = _find_contacts(labels)
     locked = {int(labels[r, c]) for r, c in rescue_points}
 
-    # ---- 4) 트인 공간 병합 + 작은 조각 정리 ----
+    # 트인 공간 병합 + 작은 조각 정리
     n_labels = int(labels.max())
     region_width = np.zeros(n_labels + 1)
     if n_labels:
@@ -367,7 +333,7 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
          round(s["length"] / max(1e-6, min(region_width[s["pair"][0]], region_width[s["pair"][1]])), 2))
         for s in segments
     ]
-    # 이웃이 하나뿐(막다른 곳)이고 안에 글자가 있는 영역은 번호가 적힌 방으로 보고 보호
+    # 막다른 곳이면서 글자가 있는 영역은 번호 방으로 보고 보호
     neighbors = [set() for _ in range(n_labels + 1)]
     for s in segments:
         a, b = s["pair"]
@@ -380,11 +346,9 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
     labels = _merge_regions(labels, segments, region_width, open_merge_ratio,
                             min_area=min_region_frac * h * w, protected=protected, locked=locked)
 
-    # ---- 건물 바깥에 붙은 영역(현관 포치, 마당 등) 제외 ----
-    # 벽은 넘지 못하게 하고(mask) 영역을 조금 넓혀서 바깥과 닿는 부분을 찾음.
-    # 테두리의 상당 부분이 바깥과 닿으면 건물 밖 영역, 일부만 닿으면 그 지점이 출구.
+    # 바깥과 많이 닿은 영역은 제외, 조금 닿은 지점은 출구
     dropped_exterior = 0
-    exits = []  # (영역 id, 출구 픽셀 좌표들)
+    exits = []
     pad = 4
     for rid, slc in enumerate(ndimage.find_objects(labels), start=1):
         if slc is None:
@@ -405,7 +369,7 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
             if len(pts) >= 2 * pad:
                 exits.append((rid, pts + np.array([ys.start, xs.start])))
 
-    # ---- 5) 문 = 남은 접촉 구간 ----
+    # 문 = 남은 접촉 구간
     contacts = _find_contacts(labels)
     lengths = [s["length"] for s in contacts if s["length"] >= 3]
     door_width = float(np.median(lengths)) if lengths else 0.0
@@ -418,7 +382,7 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
         for rid in s["pair"]:
             door_count[rid] += 1
 
-    # ---- 6) 영역 분류 ----
+    # 영역 분류
     kind, center, area, label_blobs, hatch_frac = {}, {}, {}, {}, {}
     objects = ndimage.find_objects(labels)
     for rid in region_ids:
@@ -440,13 +404,11 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
             kind[rid] = "room"
 
     if region_ids and "corridor" not in kind.values():
-        # 문 개수 기준을 넘는 영역이 없으면, 문이 가장 많은 영역을 복도로 봄
         best = max((r for r in region_ids if kind[r] == "room"), key=lambda r: door_count[r], default=None)
         if best is not None and door_count[best] >= 2:
             kind[best] = "corridor"
 
-    # 복도와 문보다 훨씬 넓게 트여 이어진 통과 공간(문 2개 이상)은 복도의 연장으로 봄.
-    # 홀이 꺾이면서 폭이 달라지면 한 덩어리로 합쳐지지 않고 '방'으로 남는 경우를 잡기 위함.
+    # 복도와 넓게 트여 이어진 통과 공간은 복도로
     final_width = {rid: 2 * float(dist[objects[rid - 1]][labels[objects[rid - 1]] == rid].max())
                    for rid in region_ids}
     changed = True
@@ -454,7 +416,6 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
         changed = False
         for s in doors:
             a, b = s["pair"]
-            # 보통 문보다 2배 이상 넓고, 좁은 쪽 영역 폭의 35% 이상을 차지하는 트임만 해당
             if s["length"] < 2 * door_width or s["length"] < 0.35 * min(final_width[a], final_width[b]):
                 continue
             for corridor_side, other in ((a, b), (b, a)):
@@ -462,7 +423,7 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
                     kind[other] = "corridor"
                     changed = True
 
-    # ---- 7) 그래프 구성 ----
+    # 그래프 구성
     def scaled(r, c):
         return float(r * scale_r), float(c * scale_c)
 
@@ -473,8 +434,8 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
 
     G = nx.Graph()
     spacing_native = corridor_node_spacing / ((scale_r + scale_c) / 2)
-    region_node = {}          # 방/계단 영역 -> 노드 id
-    corridor_nodes = {}       # 복도 영역 -> [(node id, 원본 row, 원본 col)]
+    region_node = {}
+    corridor_nodes = {}
     skeleton_native = []
     room_nodes = {}
     room_label_map = np.zeros((h, w), dtype=np.int32)
@@ -510,7 +471,6 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
             next_room_id += 1
 
     def attach_point(rid, dr, dc):
-        """문에서 그 영역 쪽으로 연결할 노드: 방/계단은 중심 노드, 복도는 가장 가까운 중심선 노드."""
         if rid in region_node:
             return region_node[rid]
         ids = corridor_nodes.get(rid)
@@ -524,7 +484,6 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
         door_mask[s["pts"][:, 0], s["pts"][:, 1]] = True
         row, col = scaled(dr, dc)
         if all(kind[rid] == "corridor" for rid in s["pair"]):
-            # 복도와 복도가 만나는 트인 지점은 문이 아니라 복도 노드로 이어 줌
             node_id = f"corridor_link_{i}"
             G.add_node(node_id, row=row, col=col, room_id=None, space_type="corridor",
                        is_door=False, is_exit=False)
@@ -550,7 +509,6 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
         if target is not None:
             add_edge(G, node_id, target)
 
-    # ---- 기존 파이프라인과 같은 형식의 출력 배열 (image_size 기준) ----
     def to_square(arr):
         return np.array(Image.fromarray(arr).resize((image_size, image_size), Image.NEAREST))
 
@@ -575,7 +533,6 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
         "room_nodes": room_nodes,
         "stats": {
             "mode": "rule",
-            # 기존 U-Net 방식의 stats 항목 이름도 유지 (이 값을 읽는 쪽이 깨지지 않도록)
             "total_doors": num_door_nodes,
             "removed_doors": 0,
             "shrunk_doors": 0,
@@ -595,7 +552,7 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
         },
         "native": {
             "labels": labels, "kind": kind, "shape": (h, w),
-            "pre_merge_contacts": pre_merge_contacts,  # (x, y, 접촉 폭, 영역 폭 대비 비율)
+            "pre_merge_contacts": pre_merge_contacts,
             "regions": {rid: {"kind": kind[rid], "doors": door_count[rid], "area": area[rid],
                               "hatch_frac": round(hatch_frac[rid], 3), "center": center[rid],
                               "label_blobs": label_blobs[rid]} for rid in region_ids},
@@ -604,11 +561,11 @@ open_merge_ratio=0.65, corridor_min_doors=4, corridor_node_spacing=30,
 
 
 def save_overlay(image_path, result, save_path):
-    """원본 도면 위에 영역/노드/엣지를 그려서 눈으로 검토하기 위한 그림."""
+    """원본 위에 영역/노드/엣지를 그린 검토용 이미지."""
     labels, kind = result["native"]["labels"], result["native"]["kind"]
     h, w = result["native"]["shape"]
     rgb = _load_rgb(image_path)
-    if rgb.shape[:2] != (h, w):  # 분석 때 max_side로 줄인 경우 같은 크기로 맞춤
+    if rgb.shape[:2] != (h, w):
         rgb = np.array(Image.fromarray(rgb).resize((w, h), Image.LANCZOS))
     rgb = rgb.astype(np.float32)
     G = result["G"]

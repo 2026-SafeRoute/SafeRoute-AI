@@ -1,32 +1,7 @@
 """
-파인튜닝된 모델(unet_finetuned.pth)의 예측 결과를 그래프로 변환하는
-통합 테스트 스크립트 (하이브리드 노드 방식).
-
-노드 생성 방식:
-  - 방(room): 방 하나당 노드 1개만 생성 (벽에서 가장 먼 지점 = distance transform
-    최대 지점). 단순 기하학적 중심이 아니라서 ㄱ자/ㄷ자 방이어도 실제로
-    걸을 수 있는 위치를 보장함.
-  - 복도(corridor)/계단(stairs)/문(door): 기존 스켈레톤 방식 그대로 유지.
-    복도를 따라 스켈레톤(중심선)을 뽑고, 분기점/끝점마다 노드를 만듦.
-    문은 스켈레톤 노드 중 문 근처에 있는 노드에 is_door=True 속성으로 표시됨
-    (문 전용 노드를 따로 만들지 않음 - 원래 방식과 동일).
-  - 방 노드와 복도 그래프는, 각 문이 어느 방과 맞닿아 있는지를 계산해서
-    "방 중앙 노드 <-> 그 문에서 가장 가까운 복도 스켈레톤 노드"로 연결함.
-
-- 출구(exit)는 지정하지 않으며, Dijkstra 대피경로 계산도 하지 않음.
-
-세그멘테이션 후처리:
-  - 문(door) 예측 노이즈 제거 + 과대 예측된 문 덩어리 축소
-  - 얇거나 끊긴 벽 보강
-  - 복도(corridor)와 계단(stairs)을 space_type 속성으로 구분
-
-사전 준비:
-  - 이 파일을 finetune_local_floorplans.py, test_pipeline.py,
-    safe_route_cubicasa_training_pycharm.py 와 같은 폴더에 둘 것
-  - unet_finetuned.pth 가 같은 폴더에 있을 것
-
-실행:
-    python run_real_floorplan_pipeline.py --image_path finetune_data/images/5.png
+도면 이미지 -> 대피 경로 그래프 변환.
+U-Net(6클래스 세그멘테이션)으로 픽셀을 분류하고, 후처리로 방/복도/문/계단을 나눠 노드와 엣지를 만든다.
+규칙 기반 분석(rule_based_floorplan)은 mode="rule"로 선택.
 """
 
 import argparse
@@ -36,12 +11,14 @@ import numpy as np
 import torch
 from PIL import Image
 from scipy import ndimage
+from skimage.morphology import h_maxima
+from skimage.segmentation import watershed
 import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from model import UNet
-import test_pipeline as tp  # label_rooms, clean_and_skeletonize, skeleton_to_graph 등 재사용
+import test_pipeline as tp
 
 try:
     from db_export import export_graph_to_postgres
@@ -50,11 +27,11 @@ except ImportError:
     DB_EXPORT_AVAILABLE = False
 
 
-# 파인튜닝 모델의 6클래스 정의 (finetune_local_floorplans.py와 동일해야 함)
+# 학습 때 쓴 클래스 순서
 FT_WALL, FT_ROOM, FT_CORRIDOR, FT_DOOR, FT_WINDOW, FT_STAIRS = range(6)
 SPACE_TYPE_NAMES = {0: "none", 1: "room", 2: "corridor", 3: "stairs"}
 
-# 6클래스 -> test_pipeline.py의 3클래스(WALL/FLOOR/DOOR) 매핑
+# 6클래스 -> test_pipeline의 WALL/FLOOR/DOOR
 CLASS_REMAP = {
     FT_WALL: tp.WALL,
     FT_ROOM: tp.FLOOR,
@@ -75,7 +52,7 @@ def predict_mask_6class(model, image_path, device, image_size=512):
         logits = model(img_tensor)
         pred_mask = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy()
 
-    return pred_mask  # 값 0~5
+    return pred_mask
 
 
 def remap_to_pipeline_classes(pred_mask_6class):
@@ -86,24 +63,19 @@ def remap_to_pipeline_classes(pred_mask_6class):
 
 
 def reinforce_walls(mask, iterations=1):
-    """
-    예측된 벽이 군데군데 끊겨 있으면 원래는 다른 방인 두 공간이
-    하나로 합쳐지는 문제가 생김 (벽이 얇게 학습된 경우 흔함).
-    벽을 room 쪽으로만 살짝 팽창시켜서 끊긴 부분을 이어줌.
-    door는 침범하지 않도록 함 (문까지 막아버리면 그래프가 끊어짐).
-    """
+    """벽을 FLOOR 쪽으로 팽창시켜 끊긴 곳을 잇는다. DOOR는 건드리지 않음."""
     if iterations <= 0:
         return mask
     wall_mask = (mask == tp.WALL)
     dilated_wall = ndimage.binary_dilation(wall_mask, iterations=iterations)
-    overwrite = dilated_wall & (mask == tp.FLOOR)  # FLOOR 쪽으로만 확장, DOOR는 보존
+    overwrite = dilated_wall & (mask == tp.FLOOR)
     reinforced = mask.copy()
     reinforced[overwrite] = tp.WALL
     return reinforced
 
 
 def build_space_type_map(pred_mask_6class):
-    """room=1, corridor=2, stairs=3 (그 외 0)을 담은 맵."""
+    """room=1, corridor=2, stairs=3, 나머지 0."""
     space_type = np.zeros_like(pred_mask_6class, dtype=np.uint8)
     space_type[pred_mask_6class == FT_ROOM] = 1
     space_type[pred_mask_6class == FT_CORRIDOR] = 2
@@ -111,8 +83,99 @@ def build_space_type_map(pred_mask_6class):
     return space_type
 
 
+def seal_wall_gaps_6class(pred, iterations):
+    """벽을 방/복도/계단 쪽으로 팽창시켜 끊긴 곳을 메운다. 문은 유지."""
+    if iterations <= 0:
+        return pred
+    dilated = ndimage.binary_dilation(pred == FT_WALL, iterations=iterations)
+    out = pred.copy()
+    out[dilated & np.isin(pred, [FT_ROOM, FT_CORRIDOR, FT_STAIRS])] = FT_WALL
+    return out
+
+
+def fill_room_blotches_6class(pred, max_hole_px):
+    """방 안의 작은 비(非)방 조각을 방으로 메운다."""
+    if max_hole_px <= 0:
+        return pred
+    room = pred == FT_ROOM
+    labels, n = ndimage.label(~room)
+    if n == 0:
+        return pred
+    sizes = np.bincount(labels.ravel())[1:]
+    small = np.isin(labels, np.where(sizes < max_hole_px)[0] + 1)
+    out = pred.copy()
+    out[small & (pred != FT_DOOR)] = FT_ROOM
+    return out
+
+
+def building_footprint_mask(image_path, out_shape, door_gap_frac=0.07, min_area_frac=0.2):
+    """
+    도면의 굵은 선을 문 틈 폭만큼 닫고 안쪽을 채워 건물 내부 마스크를 만든다.
+    면적이 너무 작으면 실패로 보고 None.
+    """
+    gray = np.array(Image.open(image_path).convert("L")).astype(np.int16)
+    h, w = gray.shape
+    dark = gray < 128
+    k = max(2, round(w / 400))
+    thick = ndimage.binary_opening(dark, structure=np.ones((k, k)))
+    gap = max(5, round(door_gap_frac * w))
+    padded = np.pad(thick, gap)
+    sealed = ndimage.binary_closing(padded, structure=np.ones((3, 3)), iterations=gap // 2)[gap:-gap, gap:-gap]
+    footprint = ndimage.binary_fill_holes(sealed)
+    if footprint.mean() < min_area_frac:
+        return None
+    fp = Image.fromarray(footprint.astype(np.uint8) * 255).resize((out_shape[1], out_shape[0]), Image.NEAREST)
+    return np.array(fp) > 0
+
+
+def absorb_corridor_like_rooms(room_labels, space_type_map, min_corridor_contact=0.35, max_area=None):
+    """테두리의 상당 부분이 복도와 바로 닿는 작은 방 조각을 복도로 돌린다."""
+    absorbed = 0
+    for room_id in range(1, int(room_labels.max()) + 1):
+        comp = room_labels == room_id
+        if not comp.any():
+            continue
+        if max_area is not None and comp.sum() > max_area:
+            continue
+        ring = ndimage.binary_dilation(comp, iterations=2) & ~comp
+        if ring.sum() == 0:
+            continue
+        if float((space_type_map[ring] == 2).mean()) >= min_corridor_contact:
+            space_type_map[comp] = 2
+            room_labels[comp] = 0
+            absorbed += 1
+    return room_labels, space_type_map, absorbed
+
+
+def remove_unsupported_walls(pred, image_path, footprint, ink_thresh=170, ink_dilate=3, min_thickness=2.0):
+    """
+    원본에 선이 없는데 벽으로 예측된 두꺼운 덩어리를 지우고 주변 클래스로 채운다.
+    실제 벽 가장자리의 얇은 오차는 min_thickness 미만이라 남는다.
+    """
+    h, w = pred.shape
+    gray = np.array(Image.open(image_path).convert("L").resize((w, h), Image.BOX))
+    ink = ndimage.binary_dilation(gray < ink_thresh, iterations=ink_dilate)
+    fake = (pred == FT_WALL) & ~ink
+    if footprint is not None:
+        fake &= footprint
+    if not fake.any():
+        return pred, 0
+    if min_thickness > 0:
+        dt = ndimage.distance_transform_edt(fake)
+        labels, n = ndimage.label(fake)
+        keep = np.zeros(n + 1, dtype=bool)
+        keep[1:] = np.asarray(ndimage.maximum(dt, labels, index=range(1, n + 1))) >= min_thickness
+        fake = keep[labels]
+    if not fake.any():
+        return pred, 0
+    _, idx = ndimage.distance_transform_edt(pred == FT_WALL, return_indices=True)
+    out = pred.copy()
+    out[fake] = pred[idx[0][fake], idx[1][fake]]
+    return out, int(fake.sum())
+
+
 def clean_door_noise(mask, min_size=25):
-    """실제 문보다 훨씬 작은 문 조각(예측 노이즈)을 찾아서 FLOOR로 되돌림."""
+    """너무 작은 문 조각은 FLOOR로 되돌린다."""
     door_labels, num_doors = ndimage.label(mask == tp.DOOR)
     if num_doors == 0:
         return mask, 0, 0
@@ -129,7 +192,7 @@ def clean_door_noise(mask, min_size=25):
 
 
 def shrink_oversized_doors(mask, max_area=200, erosion_iterations=2):
-    """실제 문 크기보다 훨씬 큰 문 덩어리를 침식시켜서 크기를 줄임."""
+    """너무 큰 문 덩어리는 침식해서 줄인다."""
     door_labels, num_doors = ndimage.label(mask == tp.DOOR)
     if num_doors == 0:
         return mask, 0
@@ -154,12 +217,7 @@ def shrink_oversized_doors(mask, max_area=200, erosion_iterations=2):
 
 
 def densify_long_edges(G, max_edge_length=40):
-    """
-    Graph Simplification으로 직선 구간의 중간 노드가 다 사라져서, 긴 복도가
-    끝점(혹은 분기점) 노드 하나로만 표현되는 문제를 완화.
-    엣지 길이가 max_edge_length를 넘으면, 그 사이에 일정 간격으로
-    중간 노드(waypoint)를 새로 끼워 넣음.
-    """
+    """max_edge_length보다 긴 엣지 사이에 중간 노드를 끼워 넣는다."""
     edges_to_process = list(G.edges(data=True))
     for u, v, data in edges_to_process:
         weight = data.get("weight", 0)
@@ -172,7 +230,6 @@ def densify_long_edges(G, max_edge_length=40):
 
         r1, c1 = G.nodes[u]["row"], G.nodes[u]["col"]
         r2, c2 = G.nodes[v]["row"], G.nodes[v]["col"]
-        # 중간 노드의 space_type은 두 끝점 중 문이 아닌 쪽을 따라감 (대개 같은 복도)
         space_type = G.nodes[u].get("space_type")
         if space_type in (None, "door"):
             space_type = G.nodes[v].get("space_type", "corridor")
@@ -193,11 +250,7 @@ def densify_long_edges(G, max_edge_length=40):
 
 
 def merge_nearby_nodes(G, node_filter, merge_radius):
-    """
-    node_filter(data) -> bool 조건을 만족하는 노드들 중, merge_radius 안에
-    가깝게 몰려있는 것들을 하나로 합침. 합쳐지는 노드들이 갖고 있던 엣지는
-    전부 대표 노드로 재연결함 (대표 노드 위치는 병합된 노드들의 평균 좌표).
-    """
+    """node_filter에 걸리는 노드 중 merge_radius 안에 몰린 것들을 하나로 합친다."""
     target_nodes = [n for n, d in G.nodes(data=True) if node_filter(d)]
 
     proximity = nx.Graph()
@@ -237,17 +290,15 @@ def merge_nearby_nodes(G, node_filter, merge_radius):
 
 
 def merge_nearby_door_nodes(G, merge_radius=15):
-    """같은 문 하나에 스켈레톤 노드가 여러 개 몰리는 문제를 완화."""
     return merge_nearby_nodes(G, lambda d: d.get("is_door"), merge_radius)
 
 
 def merge_nearby_stairs_nodes(G, merge_radius=20):
-    """같은 계단 하나에 스켈레톤 노드가 여러 개 몰리는 문제를 완화."""
     return merge_nearby_nodes(G, lambda d: d.get("space_type") == "stairs", merge_radius)
 
 
 def compute_door_connections(mask, room_labels):
-    """각 문 조각이 어느 방/복도 두 공간을 연결하는지 계산 (출구는 지정 안 함)."""
+    """문 조각마다 맞닿은 영역 id 집합과 중심을 구한다."""
     door_component_labels, num_doors = ndimage.label(mask == tp.DOOR)
 
     door_info = {}
@@ -267,30 +318,26 @@ def compute_door_connections(mask, room_labels):
 
 
 def add_space_type_to_graph(G, space_type_map):
-    """그래프 노드마다 room/corridor/stairs 중 무엇인지 속성을 부여."""
+    """스켈레톤 노드에 space_type을 붙인다. 방 픽셀 위라도 복도로 둔다(방 노드는 따로 만듦)."""
     h, w = space_type_map.shape
     for node_id, data in G.nodes(data=True):
         r = int(np.clip(round(data["row"]), 0, h - 1))
         c = int(np.clip(round(data["col"]), 0, w - 1))
         type_id = int(space_type_map[r, c])
-        G.nodes[node_id]["space_type"] = SPACE_TYPE_NAMES[type_id]
+        space_type = SPACE_TYPE_NAMES[type_id]
+        if space_type == "room":
+            space_type = "corridor"
+        G.nodes[node_id]["space_type"] = space_type
     return G
 
 
-# ------------------------------------------------------------
-# 방(room) 전용 노드 생성 (중앙 지점 방식)
-# ------------------------------------------------------------
 def build_room_only_submask(space_type_map):
-    """room(space_type==1) 픽셀만 FLOOR, 나머지는 전부 WALL인 서브마스크."""
     room_only = np.where(space_type_map == 1, tp.FLOOR, tp.WALL).astype(np.uint8)
     return room_only
 
 
 def filter_small_rooms(room_labels_only, min_size=100):
-    """
-    점처럼 작은 노이즈성 방 조각(오예측 등)을 제거하고, 남은 방들의
-    번호를 1부터 다시 연속되게 매김.
-    """
+    """min_size 미만 조각을 버리고 1부터 다시 번호를 매긴다."""
     num_labels = int(room_labels_only.max())
     if num_labels == 0:
         return room_labels_only, 0, 0
@@ -310,10 +357,7 @@ def filter_small_rooms(room_labels_only, min_size=100):
 
 
 def compute_room_center_nodes(room_labels_only, num_rooms, space_type_map):
-    """
-    방마다 노드를 하나씩만 생성. 기하학적 중심이 아니라 distance transform으로
-    계산한 '벽에서 가장 먼 지점'을 씀 (오목한 방 모양이어도 안전).
-    """
+    """방마다 벽에서 가장 먼 지점에 노드 하나."""
     room_nodes = {}
     for room_id in range(1, num_rooms + 1):
         room_mask = (room_labels_only == room_id)
@@ -333,22 +377,14 @@ def compute_room_center_nodes(room_labels_only, num_rooms, space_type_map):
     return room_nodes
 
 
-# ------------------------------------------------------------
-# 복도(corridor)/계단(stairs)/문(door) 전용 스켈레톤 그래프 (기존 방식)
-# ------------------------------------------------------------
 def clean_and_skeletonize_preserving_stairs(corridor_submask, space_type_map):
-    """
-    tp.clean_and_skeletonize()와 거의 동일하지만, Morphology opening 단계에서
-    계단(stairs)처럼 작거나 얇은 영역이 통째로 침식되어 사라지는 문제를 막기 위해
-    opening 이후 계단 픽셀을 강제로 다시 살려서 skeletonize에 넘김.
-    """
+    """모폴로지 정리 후 스켈레톤화. opening에서 지워진 계단 픽셀은 복원한다."""
     walkable = (corridor_submask == tp.FLOOR) | (corridor_submask == tp.DOOR)
 
     cleaned = ndimage.binary_closing(walkable, structure=np.ones((3, 3)))
     cleaned = ndimage.binary_opening(cleaned, structure=np.ones((3, 3)))
     cleaned = ndimage.binary_fill_holes(cleaned)
 
-    # opening 과정에서 계단 픽셀이 지워졌더라도 다시 복원 (계단은 얇아도 절대 사라지면 안 됨)
     stairs_mask = (space_type_map == 3)
     cleaned = cleaned | stairs_mask
 
@@ -357,7 +393,7 @@ def clean_and_skeletonize_preserving_stairs(corridor_submask, space_type_map):
 
 
 def build_corridor_submask(mask, space_type_map):
-    """corridor/stairs 픽셀 + door 픽셀만 살리고, room/wall은 전부 WALL 처리."""
+    """복도/계단/문만 남긴 3클래스 마스크."""
     corridor_submask = np.full(mask.shape, tp.WALL, dtype=np.uint8)
     corridor_submask[(space_type_map == 2) | (space_type_map == 3)] = tp.FLOOR
     corridor_submask[mask == tp.DOOR] = tp.DOOR
@@ -365,7 +401,7 @@ def build_corridor_submask(mask, space_type_map):
 
 
 def compute_door_room_touches(mask, room_labels_only):
-    """각 문이 어느 방(room_labels_only 기준)과 맞닿아 있는지 계산."""
+    """문 조각마다 맞닿은 방 id 집합과 중심."""
     door_component_labels, num_doors = ndimage.label(mask == tp.DOOR)
     door_room_map = {}
     for door_id in range(1, num_doors + 1):
@@ -378,10 +414,7 @@ def compute_door_room_touches(mask, room_labels_only):
 
 
 def connect_rooms_to_corridor_graph(G, corridor_G, room_nodes, door_room_map):
-    """
-    방 중앙 노드를, 그 방과 맞닿은 문에서 가장 가까운 복도 스켈레톤 노드에 연결.
-    (방 중앙 -> 문 -> 가장 가까운 복도 노드) 순서의 거리 합을 엣지 가중치로 사용.
-    """
+    """방 노드를 문에서 가장 가까운 복도 노드에 연결한다. 가중치는 방->문->복도 거리 합."""
     connected_count = 0
     for door_id, info in door_room_map.items():
         dr, dc = info["centroid"]
@@ -406,6 +439,120 @@ def connect_rooms_to_corridor_graph(G, corridor_G, room_nodes, door_room_map):
             connected_count += 1
 
     return connected_count
+
+
+def label_rooms_watershed(space_type_map, h=2.0):
+    """방 픽셀을 방 단위로 라벨링. h<=0이면 연결 성분, 아니면 h-maxima 씨앗 watershed."""
+    room = (space_type_map == 1)
+    room = ndimage.binary_closing(room, structure=np.ones((3, 3)))
+    if not room.any():
+        return np.zeros(room.shape, dtype=np.int32)
+    if h <= 0:
+        labels, _ = ndimage.label(room)
+        return labels.astype(np.int32)
+
+    dist = ndimage.distance_transform_edt(room)
+    maxima = h_maxima(dist, h)
+    markers, _ = ndimage.label(maxima)
+
+    # 씨앗이 없는 성분은 그 성분의 최댓점을 씨앗으로
+    components, num_components = ndimage.label(room)
+    for comp_id, slc in enumerate(ndimage.find_objects(components), start=1):
+        comp_mask = (components[slc] == comp_id)
+        if markers[slc][comp_mask].any():
+            continue
+        local_dist = np.where(comp_mask, dist[slc], -1)
+        r, c = np.unravel_index(np.argmax(local_dist), local_dist.shape)
+        markers[slc][r, c] = markers.max() + 1
+
+    return watershed(-dist, markers, mask=room).astype(np.int32)
+
+
+def prune_spurs(G, min_len=10):
+    """분기점에 붙은 min_len 미만의 잔가지를 제거."""
+    removed = 0
+    changed = True
+    while changed:
+        changed = False
+        for leaf in [n for n, d in G.degree() if d == 1]:
+            if leaf not in G or G.degree(leaf) != 1:
+                continue
+            path, length, prev, cur = [leaf], 0.0, None, leaf
+            while True:
+                nbrs = [x for x in G.neighbors(cur) if x != prev]
+                if len(nbrs) != 1:
+                    break
+                nxt = nbrs[0]
+                length += G[cur][nxt].get("weight", 1.0)
+                prev, cur = cur, nxt
+                path.append(cur)
+                if G.degree(cur) != 2:
+                    break
+            if G.degree(cur) >= 3 and length < min_len:
+                G.remove_nodes_from(path[:-1])
+                removed += 1
+                changed = True
+    return G, removed
+
+
+def mark_door_nodes(corridor_G, mask, radius=15):
+    """문 조각마다 가장 가까운 복도 노드 하나에만 is_door를 켠다."""
+    for _, data in corridor_G.nodes(data=True):
+        data["is_door"] = False
+
+    door_labels, num_doors = ndimage.label(mask == tp.DOOR)
+    if num_doors == 0 or corridor_G.number_of_nodes() == 0:
+        return corridor_G
+
+    centroids = ndimage.center_of_mass(mask == tp.DOOR, door_labels, range(1, num_doors + 1))
+    nodes = list(corridor_G.nodes(data=True))
+    coords = np.array([[d["row"], d["col"]] for _, d in nodes])
+    for dr, dc in centroids:
+        dist = np.hypot(coords[:, 0] - dr, coords[:, 1] - dc)
+        i = int(np.argmin(dist))
+        if dist[i] <= radius:
+            nodes[i][1]["is_door"] = True
+    return corridor_G
+
+
+def filter_small_stairs(space_type_map, min_area=300):
+    """min_area 미만의 계단 조각은 복도로 돌린다."""
+    stairs = (space_type_map == 3)
+    labels, num = ndimage.label(stairs)
+    out = space_type_map.copy()
+    removed = 0
+    if num == 0:
+        return out, 0
+    sizes = ndimage.sum(stairs, labels, index=range(1, num + 1))
+    for stair_id, size in enumerate(sizes, start=1):
+        if size < min_area:
+            out[labels == stair_id] = 2
+            removed += 1
+    return out, removed
+
+
+def connect_isolated_rooms(G, max_dist=80):
+    """연결이 없는 방 노드를 max_dist 안의 가장 가까운 복도 노드에 잇고, 고립된 복도 노드는 지운다."""
+    corridor_nodes = [n for n in G.nodes if str(n).startswith("corridor_")]
+    connected_rooms = 0
+    for node in list(G.nodes):
+        if not str(node).startswith("room_") or G.degree(node) > 0:
+            continue
+        rr, rc = G.nodes[node]["row"], G.nodes[node]["col"]
+        best, best_dist = None, float("inf")
+        for c in corridor_nodes:
+            if G.nodes[c].get("space_type") == "none":
+                continue
+            dist = ((G.nodes[c]["row"] - rr) ** 2 + (G.nodes[c]["col"] - rc) ** 2) ** 0.5
+            if dist < best_dist:
+                best, best_dist = c, dist
+        if best is not None and best_dist <= max_dist:
+            G.add_edge(node, best, weight=best_dist)
+            connected_rooms += 1
+
+    orphan_corridors = [n for n in corridor_nodes if G.degree(n) == 0]
+    G.remove_nodes_from(orphan_corridors)
+    return G, connected_rooms, len(orphan_corridors)
 
 
 def visualize_real(mask, room_labels_only, skeleton, room_nodes, G, save_path):
@@ -473,36 +620,25 @@ def visualize_real(mask, room_labels_only, skeleton, room_nodes, G, save_path):
 
 
 def analyze_floorplan(
-    image_path, model_path="unet_finetuned.pth", image_size=512,
+    image_path, model_path="unet_finetuned_v8.pth", image_size=512,
     min_door_size=25, max_door_area=200, door_erode_iterations=2,
-    wall_dilate=1, door_match_radius=15, min_room_size=100,
-    max_corridor_edge_length=40, door_merge_radius=15, stairs_merge_radius=20,
-    device=None, model=None, mode="rule", rule_node_spacing=30,
+    wall_dilate=2, door_match_radius=15, min_room_size=800,
+    max_corridor_edge_length=30, door_merge_radius=15, room_split_h=0.0,
+    spur_min_len=10, min_stairs_area=300, isolated_room_max_dist=80,
+    device=None, model=None, mode="unet", rule_node_spacing=30, stairs_merge_radius=20,
+    unet_infer_size=768, room_hole_fill=300, drop_exterior=True, corridor_absorb=0.35,
+    remove_fake_walls=True, corridor_absorb_max_area=1500,
+    room_enclosure_check=True, room_gap_frac=0.04,
 ):
     """
-    도면 이미지 하나를 받아서 최종 그래프(G)까지 만들어서 반환.
-    CLI(main())와 FastAPI 서비스 양쪽에서 재사용하기 위해 분리한 핵심 로직.
-
-    model을 미리 로딩해서 넘기면(FastAPI에서 매 요청마다 모델을 다시
-    불러오지 않도록) 그걸 재사용하고, 안 넘기면 model_path로 새로 로딩함.
-
-    mode="rule"(기본): rule_based_floorplan.py의 규칙 기반 분석 (벽선을 직접 읽음, 모델 미사용).
-        분석 중 예외가 나거나 노드를 하나도 찾지 못하면 아래 U-Net 방식으로 대체해서
-        항상 기존과 같은 형식의 결과를 돌려줌.
-    mode="unet": 기존 U-Net 세그멘테이션 기반 분석.
-    rule_node_spacing: 규칙 기반 방식의 복도 노드 간격 (image_size=512 기준 픽셀).
-
-    어느 방식이 실제로 쓰였는지는 반환값의 stats["mode"]에 기록됨
-    ("rule" / "unet" / "unet_fallback").
-
-    반환값: dict(G, mask, room_labels_only, skeleton, room_nodes, stats)
+    도면 한 장을 분석해 dict(G, mask, room_labels_only, skeleton, room_nodes, stats)를 돌려준다.
+    mode="unet"(기본)은 U-Net 세그멘테이션 + 후처리, mode="rule"은 규칙 기반이며 실패 시 U-Net으로 대체.
+    실제 쓰인 방식은 stats["mode"]에 남는다.
     """
     analysis_mode = "unet"
     if mode == "rule":
         try:
             from rule_based_floorplan import analyze_floorplan_rule_based
-            # rule_node_spacing은 image_size=512 기준 값. 요청의 image_size가 달라도
-            # 도면 대비 노드 간격(=노드 개수)이 같게 나오도록 비율을 맞춤.
             rule_result = analyze_floorplan_rule_based(
                 image_path, image_size=image_size,
                 corridor_node_spacing=rule_node_spacing * image_size / 512,
@@ -521,25 +657,75 @@ def analyze_floorplan(
         model = UNet(in_channels=3, num_classes=6).to(device)
         model.load_state_dict(torch.load(model_path, map_location=device))
 
-    pred_6class = predict_mask_6class(model, image_path, device, image_size=image_size)
+    # 픽셀 기준값들은 512 프레임 기준. 처리는 512로 하고 마지막에 좌표만 요청 크기로 환산
+    requested_size = image_size
+    image_size = 512
+
+    # 얇은 벽이 사라지지 않게 더 큰 해상도로 예측한 뒤 축소
+    infer_size = max(image_size, unet_infer_size or image_size)
+    infer_size -= infer_size % 8
+    pred_hr = predict_mask_6class(model, image_path, device, image_size=infer_size)
+    hr_scale = (infer_size * infer_size) / (image_size * image_size)
+    pred_hr = seal_wall_gaps_6class(pred_hr, iterations=wall_dilate)
+    pred_hr = fill_room_blotches_6class(pred_hr, max_hole_px=int(room_hole_fill * hr_scale))
+    dropped_exterior = False
+    footprint = None
+    if drop_exterior:
+        footprint = building_footprint_mask(image_path, pred_hr.shape)
+        if footprint is not None:
+            pred_hr = pred_hr.copy()
+            pred_hr[~footprint & (pred_hr != FT_WALL)] = FT_WALL
+            dropped_exterior = True
+    removed_fake_wall_px = 0
+    if remove_fake_walls:
+        pred_hr, removed_fake_wall_px = remove_unsupported_walls(pred_hr, image_path, footprint)
+    if infer_size != image_size:
+        pred_6class = np.array(Image.fromarray(pred_hr.astype(np.uint8)).resize(
+            (image_size, image_size), Image.NEAREST))
+    else:
+        pred_6class = pred_hr
     space_type_map = build_space_type_map(pred_6class)
+    space_type_map, removed_stairs = filter_small_stairs(space_type_map, min_area=min_stairs_area)
     mask = remap_to_pipeline_classes(pred_6class)
 
     mask, total_doors, removed_doors = clean_door_noise(mask, min_size=min_door_size)
     mask, num_shrunk = shrink_oversized_doors(
         mask, max_area=max_door_area, erosion_iterations=door_erode_iterations
     )
-    mask = reinforce_walls(mask, iterations=wall_dilate)
 
-    # ---- 방 전용 라벨링 + 중앙 노드 ----
-    room_submask = build_room_only_submask(space_type_map)
-    room_labels_only, num_rooms_only = tp.label_rooms(room_submask)
+    # 방 라벨링
+    room_labels_only = label_rooms_watershed(space_type_map, h=room_split_h)
     room_labels_only, num_rooms_only, removed_rooms = filter_small_rooms(
         room_labels_only, min_size=min_room_size
     )
+    # 방은 문 폭 이하의 틈만 가진 닫힌 공간이어야 한다. 그 밖의 조각은 방에서 뺀다
+    dropped_unenclosed = 0
+    if room_enclosure_check:
+        tight = building_footprint_mask(image_path, room_labels_only.shape, door_gap_frac=room_gap_frac)
+        if tight is not None:
+            for room_id in range(1, int(room_labels_only.max()) + 1):
+                comp = room_labels_only == room_id
+                if not comp.any() or tight[comp].mean() >= 0.5:
+                    continue
+                ring = ndimage.binary_dilation(comp, iterations=2) & ~comp
+                touches_corridor = ring.any() and (space_type_map[ring] == 2).mean() > 0.1
+                space_type_map[comp] = 2 if touches_corridor else 0
+                if not touches_corridor:
+                    mask[comp] = tp.WALL
+                room_labels_only[comp] = 0
+                dropped_unenclosed += 1
+            room_labels_only, num_rooms_only, _ = filter_small_rooms(room_labels_only, min_size=1)
+
+    absorbed_rooms = 0
+    if corridor_absorb and corridor_absorb > 0:
+        room_labels_only, space_type_map, absorbed_rooms = absorb_corridor_like_rooms(
+            room_labels_only, space_type_map, min_corridor_contact=corridor_absorb,
+            max_area=corridor_absorb_max_area,
+        )
+        room_labels_only, num_rooms_only, _ = filter_small_rooms(room_labels_only, min_size=1)
     room_nodes = compute_room_center_nodes(room_labels_only, num_rooms_only, space_type_map)
 
-    # ---- 복도/계단/문 전용 스켈레톤 그래프 ----
+    # 복도/계단/문 스켈레톤 그래프
     corridor_submask = build_corridor_submask(mask, space_type_map)
     corridor_region_labels, num_corridor_regions = tp.label_rooms(corridor_submask)
     door_info = compute_door_connections(mask, corridor_region_labels)
@@ -547,13 +733,16 @@ def analyze_floorplan(
     skeleton = clean_and_skeletonize_preserving_stairs(corridor_submask, space_type_map)
     raw_graph = tp.skeleton_to_graph(skeleton)
     corridor_G = tp.simplify_graph(raw_graph)
+    corridor_G, _ = prune_spurs(corridor_G, min_len=spur_min_len)
+    corridor_G = tp.simplify_graph(corridor_G)
     corridor_G = tp.annotate_graph(corridor_G, corridor_region_labels, door_info,
                                     door_match_radius=door_match_radius)
+    corridor_G = mark_door_nodes(corridor_G, mask, radius=door_match_radius)
     corridor_G = add_space_type_to_graph(corridor_G, space_type_map)
     corridor_G = densify_long_edges(corridor_G, max_edge_length=max_corridor_edge_length)
     corridor_G = nx.relabel_nodes(corridor_G, {n: f"corridor_{n}" for n in corridor_G.nodes})
 
-    # ---- 최종 그래프 합치기 ----
+    # 최종 그래프
     G = nx.Graph()
     for room_id, data in room_nodes.items():
         G.add_node(
@@ -566,9 +755,32 @@ def analyze_floorplan(
 
     door_room_map = compute_door_room_touches(mask, room_labels_only)
     connect_rooms_to_corridor_graph(G, corridor_G, room_nodes, door_room_map)
+    G, rooms_fallback_connected, orphan_removed = connect_isolated_rooms(
+        G, max_dist=isolated_room_max_dist
+    )
 
-    G, merged_door_count = merge_nearby_door_nodes(G, merge_radius=door_merge_radius)
+    G, merged_count = merge_nearby_door_nodes(G, merge_radius=door_merge_radius)
     G, merged_stairs_count = merge_nearby_stairs_nodes(G, merge_radius=stairs_merge_radius)
+
+    if requested_size != image_size:
+        f = requested_size / image_size
+        for _, data in G.nodes(data=True):
+            data["row"] *= f
+            data["col"] *= f
+        for _, _, data in G.edges(data=True):
+            if "weight" in data:
+                data["weight"] *= f
+        for data in room_nodes.values():
+            data["row"] *= f
+            data["col"] *= f
+            data["area"] = int(data["area"] * f * f)
+
+        def _resize(arr):
+            return np.array(Image.fromarray(arr).resize((requested_size, requested_size), Image.NEAREST))
+
+        mask = _resize(mask.astype(np.uint8))
+        room_labels_only = _resize(room_labels_only.astype(np.int32))
+        skeleton = _resize(skeleton.astype(np.uint8)) > 0
 
     return {
         "G": G,
@@ -583,8 +795,16 @@ def analyze_floorplan(
             "shrunk_doors": num_shrunk,
             "num_rooms": num_rooms_only,
             "removed_small_rooms": removed_rooms,
-            "merged_door_nodes": merged_door_count,
+            "merged_door_nodes": merged_count,
             "merged_stairs_nodes": merged_stairs_count,
+            "removed_small_stairs": removed_stairs,
+            "absorbed_corridor_rooms": absorbed_rooms,
+            "removed_fake_wall_px": removed_fake_wall_px,
+            "dropped_unenclosed_rooms": dropped_unenclosed,
+            "dropped_exterior": dropped_exterior,
+            "unet_infer_size": infer_size,
+            "fallback_connected_rooms": rooms_fallback_connected,
+            "removed_orphan_corridors": orphan_removed,
         },
     }
 
@@ -592,38 +812,30 @@ def analyze_floorplan(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_path", type=str, required=True)
-    parser.add_argument("--mode", type=str, default="rule", choices=["rule", "unet"],
-                        help="rule: 벽선을 직접 읽는 규칙 기반 (기본) / unet: 학습된 U-Net 사용")
-    parser.add_argument("--model_path", type=str, default="unet_finetuned.pth")
+    parser.add_argument("--mode", type=str, default="unet", choices=["unet", "rule"],
+                        help="unet: U-Net 세그멘테이션 (기본) / rule: 규칙 기반")
+    parser.add_argument("--unet_infer_size", type=int, default=768, help="U-Net 예측 해상도")
+    parser.add_argument("--model_path", type=str, default="unet_finetuned_v8.pth")
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--save_path", type=str, default="real_floorplan_pipeline_result.png")
-    parser.add_argument("--min_door_size", type=int, default=25,
-                        help="이보다 작은 문 조각은 노이즈로 간주하고 FLOOR로 되돌림")
-    parser.add_argument("--max_door_area", type=int, default=200,
-                        help="이보다 큰 문 조각은 과잉예측으로 간주하고 침식시켜 줄임")
-    parser.add_argument("--door_erode_iterations", type=int, default=2,
-                        help="과대 문 조각을 줄일 때 침식 반복 횟수")
-    parser.add_argument("--wall_dilate", type=int, default=1,
-                        help="예측된 벽을 이 픽셀 수만큼 두껍게 보강 (0이면 비활성화)")
-    parser.add_argument("--door_match_radius", type=int, default=15,
-                        help="복도 스켈레톤 노드를 문으로 인식하는 반경(픽셀)")
-    parser.add_argument("--min_room_size", type=int, default=100,
-                        help="이 픽셀 수보다 작은 방 조각은 노이즈로 간주하고 제외")
-    parser.add_argument("--max_corridor_edge_length", type=int, default=40,
-                        help="복도 엣지가 이보다 길면 중간에 노드를 추가로 끼워 넣음")
-    parser.add_argument("--door_merge_radius", type=int, default=15,
-                        help="이 반경(픽셀) 안에 있는 문 노드들은 하나로 병합")
-    parser.add_argument("--stairs_merge_radius", type=int, default=20,
-                        help="이 반경(픽셀) 안에 있는 계단 노드들은 하나로 병합")
-    parser.add_argument("--export_db", action="store_true",
-                        help="완성된 그래프를 PostgreSQL에 저장 (db_export.py, schema.sql 필요)")
+    parser.add_argument("--min_door_size", type=int, default=25, help="이보다 작은 문 조각은 제거")
+    parser.add_argument("--max_door_area", type=int, default=200, help="이보다 큰 문 조각은 침식")
+    parser.add_argument("--door_erode_iterations", type=int, default=2)
+    parser.add_argument("--room_split_h", type=float, default=0.0, help="0이면 연결 성분, >0이면 watershed h")
+    parser.add_argument("--spur_min_len", type=int, default=10, help="이보다 짧은 복도 잔가지는 제거")
+    parser.add_argument("--wall_dilate", type=int, default=2, help="벽 팽창 픽셀 수")
+    parser.add_argument("--door_match_radius", type=int, default=15)
+    parser.add_argument("--min_room_size", type=int, default=800, help="이보다 작은 방 조각은 제외")
+    parser.add_argument("--max_corridor_edge_length", type=int, default=30, help="복도 노드 간격")
+    parser.add_argument("--door_merge_radius", type=int, default=15)
+    parser.add_argument("--stairs_merge_radius", type=int, default=20)
+    parser.add_argument("--export_db", action="store_true", help="PostgreSQL 저장 (db_export.py 필요)")
     parser.add_argument("--db_host", type=str, default="localhost")
     parser.add_argument("--db_port", type=int, default=5432)
     parser.add_argument("--db_name", type=str, default="saferoute")
     parser.add_argument("--db_user", type=str, default="postgres")
     parser.add_argument("--db_password", type=str, default="")
-    parser.add_argument("--floorplan_name", type=str, default=None,
-                        help="DB에 저장할 도면 이름 (지정 안 하면 이미지 파일명 사용)")
+    parser.add_argument("--floorplan_name", type=str, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -635,8 +847,9 @@ def main():
         door_erode_iterations=args.door_erode_iterations, wall_dilate=args.wall_dilate,
         door_match_radius=args.door_match_radius, min_room_size=args.min_room_size,
         max_corridor_edge_length=args.max_corridor_edge_length,
-        door_merge_radius=args.door_merge_radius, stairs_merge_radius=args.stairs_merge_radius,
-        device=device, mode=args.mode,
+        door_merge_radius=args.door_merge_radius, room_split_h=args.room_split_h,
+        spur_min_len=args.spur_min_len, device=device, mode=args.mode,
+        unet_infer_size=args.unet_infer_size, stairs_merge_radius=args.stairs_merge_radius,
     )
     print(f"   -> 분석 방식: {result['stats'].get('mode')}, 통계: {result['stats']}")
     G = result["G"]
@@ -654,17 +867,16 @@ def main():
 
     isolated = list(nx.isolates(G))
     if isolated:
-        print(f"   -> 주의: 어떤 문과도 연결되지 않은 고립 노드 {len(isolated)}개 있음: {isolated}")
+        print(f"   -> 고립 노드 {len(isolated)}개: {isolated}")
 
     print("결과 시각화...")
     visualize_real(mask, room_labels_only, skeleton, room_nodes, G, save_path=args.save_path)
 
     if result["stats"].get("mode") == "rule":
-        # 원본 도면 위에 방/문/복도 노드를 그린 검토용 그림 (원본 비율 그대로)
         from rule_based_floorplan import save_overlay
         overlay_path = os.path.splitext(args.save_path)[0] + "_overlay.png"
         save_overlay(args.image_path, result, overlay_path)
-        print(f"검토용 오버레이 저장 완료: {os.path.abspath(overlay_path)}")
+        print(f"오버레이 저장 완료: {os.path.abspath(overlay_path)}")
 
     if args.export_db:
         if not DB_EXPORT_AVAILABLE:

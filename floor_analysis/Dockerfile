@@ -20,9 +20,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # floor_analysis 실행에 필요한 파일만 복사한다.
 COPY model.py ./
 COPY run_real_floorplan_pipeline.py ./
+COPY rule_based_floorplan.py ./
 COPY test_pipeline.py ./
 COPY fastapi_service.py ./
 COPY unet_finetuned.pth ./
+COPY unet_finetuned_v8.pth ./
 
 EXPOSE 8000
 

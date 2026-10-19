@@ -1,18 +1,8 @@
 """
 Safe Route AI 분석 서비스 (FastAPI)
 
-
-노드 타입 매핑:
-    is_door=True                -> DOOR
-    space_type == "room"        -> ROOM
-    space_type == "corridor"    -> HALLWAY
-    space_type == "stairs"      -> STAIR
-    EXIT / CUSTOM 은 이 서비스가 생성하지 않음 (관리자가 나중에 지정)
-
-좌표: 0.0~1.0 정규화 (MapNode.pos_x/pos_y 규격에 맞춤)
-거리: 미터 단위 (MapEdge.distance 규격에 맞춤).
-    요청 시 real_width_m/real_height_m(도면이 나타내는 실제 층 크기, 업로드 시
-    관리자가 같이 입력)을 받아서 픽셀->미터 변환에 사용함.
+노드 타입: is_door -> DOOR, room -> ROOM, corridor -> HALLWAY, stairs -> STAIR (EXIT/CUSTOM은 관리자가 지정)
+좌표는 0~1 정규화, 거리는 요청의 real_width_m/real_height_m로 환산한 미터.
 """
 
 import os
@@ -40,16 +30,15 @@ from model import UNet
 
 app = FastAPI(title="Safe Route AI Service")
 
-MODEL_PATH = os.environ.get("SAFEROUTE_MODEL_PATH", "unet_finetuned.pth")
+MODEL_PATH = os.environ.get("SAFEROUTE_MODEL_PATH", "unet_finetuned_v8.pth")
 S3_BUCKET = os.environ.get("SAFEROUTE_S3_BUCKET")
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu")
 
-# 도면 분석 방식: "rule"(기본, 벽선을 직접 읽는 규칙 기반) / "unet"(기존 U-Net 방식).
-# 문제가 생기면 코드 수정 없이 SAFEROUTE_ANALYSIS_MODE=unet 으로 기존 방식으로 되돌릴 수 있음.
-ANALYSIS_MODE = os.environ.get("SAFEROUTE_ANALYSIS_MODE", "rule").strip().lower()
+# unet(기본) / rule. 환경변수로 전환
+ANALYSIS_MODE = os.environ.get("SAFEROUTE_ANALYSIS_MODE", "unet").strip().lower()
 if ANALYSIS_MODE not in ("rule", "unet"):
-    print(f"경고: SAFEROUTE_ANALYSIS_MODE 값이 올바르지 않아 'rule'을 사용합니다. (입력값: {ANALYSIS_MODE})")
-    ANALYSIS_MODE = "rule"
+    print(f"경고: SAFEROUTE_ANALYSIS_MODE 값이 올바르지 않아 'unet'을 사용합니다. (입력값: {ANALYSIS_MODE})")
+    ANALYSIS_MODE = "unet"
 
 _model = None
 _s3_client = None
@@ -83,11 +72,7 @@ def download_image_from_s3(image_key: str) -> Image.Image:
 
 
 def to_rgb_on_white(image: Image.Image) -> Image.Image:
-    """
-    투명 배경이 있는 이미지(PNG 등)를 흰 배경 위에 합성해서 RGB로 변환.
-    그냥 convert("RGB")를 하면 투명한 부분이 검은색이 되는데, 도면 분석은
-    검은색을 벽으로 읽기 때문에 결과가 완전히 틀어짐.
-    """
+    """투명 배경은 흰색 위에 합성. 그냥 RGB로 바꾸면 투명 영역이 검정(벽)이 된다."""
     if image.mode in ("RGBA", "LA", "P"):
         image = image.convert("RGBA")
         background = Image.new("RGBA", image.size, (255, 255, 255, 255))
@@ -95,22 +80,19 @@ def to_rgb_on_white(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
-# ------------------------------------------------------------
-# 요청/응답 스키마
-# ------------------------------------------------------------
 class AnalyzeRequest(BaseModel):
     image_key: str = Field(..., description="S3 상의 도면 이미지 키(경로)")
-    real_width_m: float = Field(..., gt=0, description="이 도면이 나타내는 층의 실제 가로 길이(미터)")
-    real_height_m: float = Field(..., gt=0, description="이 도면이 나타내는 층의 실제 세로 길이(미터)")
-    image_size: int = Field(512, description="분석용 내부 리사이즈 크기 (모델 입력 크기)")
+    real_width_m: float = Field(..., gt=0, description="도면이 나타내는 층의 실제 가로 길이(m)")
+    real_height_m: float = Field(..., gt=0, description="도면이 나타내는 층의 실제 세로 길이(m)")
+    image_size: int = Field(512, description="분석용 내부 리사이즈 크기")
 
 
 class NodeOut(BaseModel):
-    temp_id: str          # Spring 노드<->엣지를 매핑 임시 키
+    temp_id: str
     code: str
-    type: str               # ROOM / HALLWAY / STAIR / DOOR
-    x: float                 # 0.0~1.0 정규화 x좌표
-    y: float                 # 0.0~1.0 정규화 y좌표
+    type: str
+    x: float
+    y: float
 
 
 class EdgeOut(BaseModel):
@@ -135,13 +117,10 @@ def map_space_type_to_node_type(is_door: bool, space_type: str) -> str:
     return mapping.get(space_type, "HALLWAY")
 
 
-# ------------------------------------------------------------
-# 엔드포인트
-# ------------------------------------------------------------
 @app.post("/analyze-floorplan", response_model=AnalyzeResponse)
 def analyze_floorplan_endpoint(req: AnalyzeRequest):
     original_image = download_image_from_s3(req.image_key)
-    plan_width_px, plan_height_px = original_image.size  # 리사이즈 전 원본 픽셀 크기
+    plan_width_px, plan_height_px = original_image.size
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
         original_image.save(tmp.name)
@@ -161,11 +140,9 @@ def analyze_floorplan_endpoint(req: AnalyzeRequest):
     if G.number_of_nodes() == 0:
         raise HTTPException(status_code=422, detail="도면에서 노드를 하나도 찾지 못했습니다.")
 
-    # x(col)축 = 가로, y(row)축 = 세로
     width_scale = req.real_width_m / req.image_size
     height_scale = req.real_height_m / req.image_size
 
-    # 타입별로 순번을 매겨서 code 생성 (예: door_1, room_1, room_2, ...)
     type_counters: dict = {}
     nodes_out = []
     for node_key, data in G.nodes(data=True):
@@ -190,7 +167,7 @@ def analyze_floorplan_endpoint(req: AnalyzeRequest):
         dr = G.nodes[u]["row"] - G.nodes[v]["row"]
         dc = G.nodes[u]["col"] - G.nodes[v]["col"]
         distance_m = math.sqrt((dc * width_scale) ** 2 + (dr * height_scale) ** 2)
-        if round(distance_m, 3) <= 0:  # 반올림 후 0.000이 되는 경우도 포함 (BE는 0 이하 거리를 거부함)
+        if round(distance_m, 3) <= 0:  # BE는 0 이하 거리를 거부함
             distance_m = 0.01
         edges_out.append(
             EdgeOut(
@@ -227,13 +204,11 @@ def health():
     }
 
 
-# ------------------------------------------------------------
-# 개발용 엔드포인트 (S3 접근 권한 세팅 전, 로컬 파일 테스트용)
-# ------------------------------------------------------------
+# 개발용: S3 없이 로컬 파일로 테스트 (ENABLE_LOCAL_TEST=true)
 if os.environ.get("ENABLE_LOCAL_TEST", "false").lower() == "true":
 
     class AnalyzeLocalRequest(BaseModel):
-        local_image_path: str = Field(..., description="S3 대신 로컬 파일 경로로 테스트 (개발용)")
+        local_image_path: str = Field(..., description="로컬 도면 파일 경로")
         real_width_m: float = Field(..., gt=0)
         real_height_m: float = Field(..., gt=0)
         image_size: int = Field(512)
@@ -280,7 +255,7 @@ if os.environ.get("ENABLE_LOCAL_TEST", "false").lower() == "true":
             dr = G.nodes[u]["row"] - G.nodes[v]["row"]
             dc = G.nodes[u]["col"] - G.nodes[v]["col"]
             distance_m = math.sqrt((dc * width_scale) ** 2 + (dr * height_scale) ** 2)
-            if round(distance_m, 3) <= 0:  # 반올림 후 0.000이 되는 경우도 포함 (BE는 0 이하 거리를 거부함)
+            if round(distance_m, 3) <= 0:
                 distance_m = 0.01
             edges_out.append(EdgeOut(
                 from_temp_id=str(u), to_temp_id=str(v),

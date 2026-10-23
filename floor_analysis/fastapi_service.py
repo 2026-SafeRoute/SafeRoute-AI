@@ -178,6 +178,12 @@ def analyze_floorplan_endpoint(req: AnalyzeRequest):
             )
         )
 
+    counts = {}
+    for n in nodes_out:
+        counts[n.type] = counts.get(n.type, 0) + 1
+    print(f"분석 완료: key={req.image_key} mode={result['stats'].get('mode')} model={MODEL_PATH} "
+          f"nodes={len(nodes_out)} edges={len(edges_out)} {counts}")
+
     return AnalyzeResponse(
         plan_width_px=plan_width_px, plan_height_px=plan_height_px,
         nodes=nodes_out, edges=edges_out, stats=result["stats"],
@@ -198,6 +204,7 @@ def health():
         "status": "ok",
         "device": str(DEVICE),
         "model_loaded": _model is not None,
+        "model_path": MODEL_PATH,
         "analysis_mode": ANALYSIS_MODE,
         "bucket": S3_BUCKET,
         "bucket_accessible": s3_ok,

@@ -531,6 +531,28 @@ def filter_small_stairs(space_type_map, min_area=300):
     return out, removed
 
 
+def drop_internal_doors(mask, space_type_map, room_labels_only):
+    """복도와 닿지 않고 방 하나에만 붙은 문 조각은 문이 아니라고 보고 바닥으로 돌린다."""
+    door_labels, n = ndimage.label(mask == tp.DOOR)
+    removed = 0
+    pad = 4
+    for door_id, slc in enumerate(ndimage.find_objects(door_labels), start=1):
+        if slc is None:
+            continue
+        ys = slice(max(0, slc[0].start - pad), min(mask.shape[0], slc[0].stop + pad))
+        xs = slice(max(0, slc[1].start - pad), min(mask.shape[1], slc[1].stop + pad))
+        comp = door_labels[ys, xs] == door_id
+        ring = ndimage.binary_dilation(comp, iterations=3) & ~comp
+        rooms = set(room_labels_only[ys, xs][ring].tolist()) - {0}
+        touches_corridor = bool((space_type_map[ys, xs][ring] >= 2).any())
+        if touches_corridor or len(rooms) >= 2:
+            continue
+        mask[ys, xs][comp] = tp.FLOOR
+        space_type_map[ys, xs][comp] = 1 if rooms else 0
+        removed += 1
+    return mask, space_type_map, removed
+
+
 def connect_isolated_rooms(G, max_dist=80):
     """연결이 없는 방 노드를 max_dist 안의 가장 가까운 복도 노드에 잇고, 고립된 복도 노드는 지운다."""
     corridor_nodes = [n for n in G.nodes if str(n).startswith("corridor_")]
@@ -628,7 +650,7 @@ def analyze_floorplan(
     device=None, model=None, mode="unet", rule_node_spacing=30, stairs_merge_radius=20,
     unet_infer_size=768, room_hole_fill=300, drop_exterior=True, corridor_absorb=0.35,
     remove_fake_walls=True, corridor_absorb_max_area=1500,
-    room_enclosure_check=True, room_gap_frac=0.04,
+    room_enclosure_check=True, room_gap_frac=0.04, corridor_merge_radius=20,
 ):
     """
     도면 한 장을 분석해 dict(G, mask, room_labels_only, skeleton, room_nodes, stats)를 돌려준다.
@@ -724,6 +746,7 @@ def analyze_floorplan(
         )
         room_labels_only, num_rooms_only, _ = filter_small_rooms(room_labels_only, min_size=1)
     room_nodes = compute_room_center_nodes(room_labels_only, num_rooms_only, space_type_map)
+    mask, space_type_map, removed_internal_doors = drop_internal_doors(mask, space_type_map, room_labels_only)
 
     # 복도/계단/문 스켈레톤 그래프
     corridor_submask = build_corridor_submask(mask, space_type_map)
@@ -739,8 +762,25 @@ def analyze_floorplan(
                                     door_match_radius=door_match_radius)
     corridor_G = mark_door_nodes(corridor_G, mask, radius=door_match_radius)
     corridor_G = add_space_type_to_graph(corridor_G, space_type_map)
-    corridor_G = densify_long_edges(corridor_G, max_edge_length=max_corridor_edge_length)
     corridor_G = nx.relabel_nodes(corridor_G, {n: f"corridor_{n}" for n in corridor_G.nodes})
+
+    # 방 안에 생긴 스켈레톤 조각 제거
+    h_map, w_map = room_labels_only.shape
+    inside_room = [
+        n for n, d in corridor_G.nodes(data=True)
+        if room_labels_only[
+            int(np.clip(round(d["row"]), 0, h_map - 1)), int(np.clip(round(d["col"]), 0, w_map - 1))] > 0
+    ]
+    corridor_G.remove_nodes_from(inside_room)
+
+    # 가까운 복도 노드는 합치고, 긴 구간만 다시 나눈다
+    corridor_G, merged_corridor_count = merge_nearby_nodes(
+        corridor_G, lambda d: not d.get("is_door") and d.get("space_type") != "stairs", corridor_merge_radius)
+    for _, d in corridor_G.nodes(data=True):
+        if d.get("space_type") == "none":
+            d["space_type"] = "corridor"
+    corridor_G = densify_long_edges(corridor_G, max_edge_length=max_corridor_edge_length)
+    main_corridor = max(nx.connected_components(corridor_G), key=len) if corridor_G.number_of_nodes() else set()
 
     # 최종 그래프
     G = nx.Graph()
@@ -754,7 +794,13 @@ def analyze_floorplan(
     G.add_edges_from(corridor_G.edges(data=True))
 
     door_room_map = compute_door_room_touches(mask, room_labels_only)
-    connect_rooms_to_corridor_graph(G, corridor_G, room_nodes, door_room_map)
+    connect_rooms_to_corridor_graph(G, corridor_G.subgraph(main_corridor), room_nodes, door_room_map)
+    # 방이 하나도 붙지 않은 복도 조각은 버린다
+    removed_fragments = 0
+    for comp in list(nx.connected_components(G)):
+        if not any(str(n).startswith("room_") for n in comp):
+            G.remove_nodes_from(comp)
+            removed_fragments += 1
     G, rooms_fallback_connected, orphan_removed = connect_isolated_rooms(
         G, max_dist=isolated_room_max_dist
     )
@@ -797,6 +843,10 @@ def analyze_floorplan(
             "removed_small_rooms": removed_rooms,
             "merged_door_nodes": merged_count,
             "merged_stairs_nodes": merged_stairs_count,
+            "merged_corridor_nodes": merged_corridor_count,
+            "removed_room_fragments": len(inside_room),
+            "removed_internal_doors": removed_internal_doors,
+            "removed_corridor_fragments": removed_fragments,
             "removed_small_stairs": removed_stairs,
             "absorbed_corridor_rooms": absorbed_rooms,
             "removed_fake_wall_px": removed_fake_wall_px,
@@ -829,6 +879,7 @@ def main():
     parser.add_argument("--max_corridor_edge_length", type=int, default=30, help="복도 노드 간격")
     parser.add_argument("--door_merge_radius", type=int, default=15)
     parser.add_argument("--stairs_merge_radius", type=int, default=20)
+    parser.add_argument("--corridor_merge_radius", type=int, default=20, help="이 반경 안의 복도 노드는 하나로 합침")
     parser.add_argument("--export_db", action="store_true", help="PostgreSQL 저장 (db_export.py 필요)")
     parser.add_argument("--db_host", type=str, default="localhost")
     parser.add_argument("--db_port", type=int, default=5432)
@@ -850,6 +901,7 @@ def main():
         door_merge_radius=args.door_merge_radius, room_split_h=args.room_split_h,
         spur_min_len=args.spur_min_len, device=device, mode=args.mode,
         unet_infer_size=args.unet_infer_size, stairs_merge_radius=args.stairs_merge_radius,
+        corridor_merge_radius=args.corridor_merge_radius,
     )
     print(f"   -> 분석 방식: {result['stats'].get('mode')}, 통계: {result['stats']}")
     G = result["G"]

@@ -651,7 +651,6 @@ def analyze_floorplan(
     unet_infer_size=768, room_hole_fill=300, drop_exterior=True, corridor_absorb=0.35,
     remove_fake_walls=True, corridor_absorb_max_area=1500,
     room_enclosure_check=True, room_gap_frac=0.04, corridor_merge_radius=20,
-    exterior_stairs_max_dist=90,
 ):
     """
     도면 한 장을 분석해 dict(G, mask, room_labels_only, skeleton, room_nodes, stats)를 돌려준다.
@@ -693,20 +692,9 @@ def analyze_floorplan(
     pred_hr = fill_room_blotches_6class(pred_hr, max_hole_px=int(room_hole_fill * hr_scale))
     dropped_exterior = False
     footprint = None
-    exterior_stairs = []  # (중심 row, 중심 col, 계단 영역까지의 거리 맵) image_size 프레임
     if drop_exterior:
         footprint = building_footprint_mask(image_path, pred_hr.shape)
         if footprint is not None:
-            ext = (pred_hr == FT_STAIRS) & ~footprint
-            grouped, n_groups = ndimage.label(ndimage.binary_dilation(ext, iterations=25))
-            for gid in range(1, n_groups + 1):
-                comp = ext & (grouped == gid)
-                if comp.sum() >= min_stairs_area * hr_scale:
-                    r, c = ndimage.center_of_mass(comp)
-                    comp_small = np.array(Image.fromarray(comp.astype(np.uint8) * 255).resize(
-                        (image_size, image_size), Image.NEAREST)) > 0
-                    dist_map = ndimage.distance_transform_edt(~comp_small)
-                    exterior_stairs.append((r * image_size / infer_size, c * image_size / infer_size, dist_map))
             pred_hr = pred_hr.copy()
             pred_hr[~footprint & (pred_hr != FT_WALL)] = FT_WALL
             dropped_exterior = True
@@ -820,24 +808,6 @@ def analyze_floorplan(
     G, merged_count = merge_nearby_door_nodes(G, merge_radius=door_merge_radius)
     G, merged_stairs_count = merge_nearby_stairs_nodes(G, merge_radius=stairs_merge_radius)
 
-    # 건물 밖 계단은 노드 하나로 만들어 가장 가까운 문/복도 노드에 잇는다
-    exterior_stairs_added = 0
-    for i, (sr, sc, dist_map) in enumerate(exterior_stairs, start=1):
-        best, best_dist = None, float("inf")
-        for n, d in G.nodes(data=True):
-            if str(n).startswith("room_") or d.get("space_type") == "room":
-                continue
-            rr = int(np.clip(round(d["row"]), 0, image_size - 1))
-            cc = int(np.clip(round(d["col"]), 0, image_size - 1))
-            dist = float(dist_map[rr, cc])  # 노드에서 계단 영역 가장자리까지
-            if dist < best_dist:
-                best, best_dist = n, dist
-        if best is not None and best_dist <= exterior_stairs_max_dist:
-            node_id = f"stairs_ext_{i}"
-            G.add_node(node_id, row=float(sr), col=float(sc), room_id=None, space_type="stairs", is_door=False)
-            G.add_edge(node_id, best, weight=float(((G.nodes[best]["row"] - sr) ** 2 + (G.nodes[best]["col"] - sc) ** 2) ** 0.5))
-            exterior_stairs_added += 1
-
     if requested_size != image_size:
         f = requested_size / image_size
         for _, data in G.nodes(data=True):
@@ -876,7 +846,6 @@ def analyze_floorplan(
             "merged_corridor_nodes": merged_corridor_count,
             "removed_room_fragments": len(inside_room),
             "removed_internal_doors": removed_internal_doors,
-            "exterior_stairs_nodes": exterior_stairs_added,
             "removed_corridor_fragments": removed_fragments,
             "removed_small_stairs": removed_stairs,
             "absorbed_corridor_rooms": absorbed_rooms,

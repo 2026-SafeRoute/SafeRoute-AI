@@ -116,19 +116,20 @@ def test_congestion_event_is_not_delayed_by_blocked_monitoring_uploads():
     queue.close()
 
 
-class BarrierRenderer:
+class BarrierClient(Client):
     def __init__(self, parties):
+        super().__init__()
         self.barrier = threading.Barrier(parties, timeout=2)
 
-    def render(self, frame, detections, inside_detections):
+    def report(self, observation):
         self.barrier.wait()
-        return frame
+        return super().report(observation)
 
 
 def test_monitoring_snapshots_are_delivered_by_parallel_workers():
-    client = Client()
-    # 두 작업이 동시에 렌더링 단계에 들어와야만 barrier를 통과한다.
-    queue = DeliveryQueue(client, BarrierRenderer(2), monitoring_workers=2)
+    client = BarrierClient(2)
+    # 두 작업이 동시에 전송 단계에 들어와야만 barrier를 통과한다.
+    queue = DeliveryQueue(client, PassthroughRenderer(), monitoring_workers=2)
     queue.set_session(SESSION)
 
     assert queue.submit_monitoring(monitoring("first"))
@@ -360,4 +361,47 @@ def test_monitoring_snapshot_is_downscaled_but_event_evidence_keeps_original_res
     assert decode(monitoring_jpeg).shape == (240, 640, 3)
     assert decode(event_jpeg).shape == (480, 1280, 3)
     assert len(monitoring_jpeg) * 4 < len(event_jpeg)
+    queue.close()
+
+
+def test_backlogged_monitoring_jobs_skip_image_upload_and_only_freshest_uploads():
+    renderer = BlockingRenderer()
+    client = UploadRecordingClient()
+    queue = DeliveryQueue(client, renderer, monitoring_workers=1, monitoring_max_items=4)
+    queue.set_session(SESSION)
+
+    assert queue.submit_monitoring(monitoring("active"))
+    assert renderer.entered.wait(1)
+    assert queue.submit_monitoring(monitoring("old"))
+    assert queue.submit_monitoring(monitoring("new"))
+    assert queue.submit_monitoring(monitoring("newest"))
+
+    renderer.release.set()
+    assert queue.wait_idle()
+    image_keys = {o.event_id: o.monitoring_image_key for o in client.observations}
+    # 뒤에 더 새 스냅샷이 있던 작업은 인원 수만 보내고, 가장 최신 것만 이미지를 올린다.
+    assert image_keys["old"] is None
+    assert image_keys["new"] is None
+    assert image_keys["active"] == "MONITORING"
+    assert image_keys["newest"] == "MONITORING"
+    assert renderer.calls == 2
+    queue.close()
+
+
+def test_monitoring_lane_is_capped_by_monitoring_max_items():
+    renderer = BlockingRenderer()
+    client = Client()
+    queue = DeliveryQueue(client, renderer, max_items=32, monitoring_workers=1,
+                          monitoring_max_items=2)
+    queue.set_session(SESSION)
+
+    assert queue.submit_monitoring(monitoring("active"))
+    assert renderer.entered.wait(1)
+    for index in range(5):
+        assert queue.submit_monitoring(monitoring(f"queued-{index}"))
+    assert queue.pending_count == 2
+
+    renderer.release.set()
+    assert queue.wait_idle()
+    assert [event_id for _, event_id in client.delivered] == ["active", "queued-3", "queued-4"]
     queue.close()

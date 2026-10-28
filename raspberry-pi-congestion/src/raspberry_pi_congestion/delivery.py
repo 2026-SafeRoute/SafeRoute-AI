@@ -43,9 +43,15 @@ class DeliveryQueue:
     Congestion events and offline replay run on one dedicated worker so their
     order is preserved and slow monitoring uploads never delay them. Monitoring
     snapshots run on a small worker pool because the backend tolerates
-    out-of-order observations. Each lane holds at most ``max_items`` jobs; when
-    the monitoring lane is full, its oldest snapshot is discarded. Frames remain
-    unencoded until a worker handles them.
+    out-of-order observations. The event lane holds at most ``max_items`` jobs
+    and the monitoring lane at most ``min(max_items, monitoring_max_items)``;
+    when the monitoring lane is full, its oldest snapshot is discarded. Frames
+    remain unencoded until a worker handles them.
+
+    When newer snapshots are already waiting behind a monitoring job, that job
+    is sent as a headcount-only observation (no presign/S3 PUT), so a backlog
+    drains with one request per job instead of three and the live image always
+    comes from the freshest snapshot.
 
     Monitoring snapshots are only for live congestion monitoring, so they are
     downscaled and encoded at a lower JPEG quality to shorten the S3 PUT.
@@ -58,9 +64,12 @@ class DeliveryQueue:
                  epoch_ms: Callable[[], int] = lambda: int(time.time() * 1000),
                  monitoring_jpeg_quality: int = 70,
                  monitoring_max_width: int = 960,
-                 monitoring_workers: int = 2) -> None:
+                 monitoring_workers: int = 2,
+                 monitoring_max_items: int = 4) -> None:
         if max_items <= 0:
             raise ValueError("max_items must be positive")
+        if monitoring_max_items <= 0:
+            raise ValueError("monitoring_max_items must be positive")
         if monitoring_workers <= 0:
             raise ValueError("monitoring_workers must be positive")
         if shutdown_timeout_sec < 0:
@@ -73,6 +82,8 @@ class DeliveryQueue:
         self.renderer = renderer
         self.offline_queue = offline_queue
         self.max_items = max_items
+        # 모니터링은 실시간 화면/혼잡 판정용이라 오래 쌓아 둘 이유가 없다. 1초 주기 기준 몇 초분만 둔다.
+        self.monitoring_max_items = min(max_items, monitoring_max_items)
         self.shutdown_timeout_sec = shutdown_timeout_sec
         self.max_presigned_refreshes = max_presigned_refreshes
         self.monitoring_jpeg_quality = monitoring_jpeg_quality
@@ -117,9 +128,12 @@ class DeliveryQueue:
         with self._condition:
             if not self._can_accept(job.training_session_id):
                 return False
-            if len(self._monitoring) >= self.max_items:
+            if len(self._monitoring) >= self.monitoring_max_items:
                 self._monitoring.popleft()
-                logger.warning("Dropped oldest monitoring snapshot from full delivery queue")
+                logger.warning(
+                    "Dropped oldest monitoring snapshot from full delivery queue "
+                    "(network/server slower than snapshot interval)"
+                )
             self._monitoring.append(job)
             # 두 레인의 워커가 Condition 하나를 공유하므로 다른 레인 워커만 깨우지 않도록 모두 깨운다.
             self._condition.notify_all()
@@ -207,15 +221,18 @@ class DeliveryQueue:
                 if self._stop:
                     return
                 job = self._monitoring.popleft()
+                # 뒤에 더 새 스냅샷이 기다리고 있으면 이 작업은 인원 수만 보내고 이미지는 건너뛴다.
+                # 화면 이미지는 어차피 더 새 스냅샷으로 덮이고, 업로드 2회를 줄여야 밀린 큐가 따라잡는다.
+                with_image = not self._monitoring
                 self._begin(job)
-            self._execute(job)
+            self._execute(job, with_image)
 
     def _begin(self, job) -> None:
         self._inflight[threading.get_ident()] = (
             self._job_session(job) if job is not None else self._active_session_id
         )
 
-    def _execute(self, job) -> None:
+    def _execute(self, job, with_image: bool = True) -> None:
         try:
             if job is None:
                 self._flush_offline()
@@ -223,7 +240,7 @@ class DeliveryQueue:
                 if isinstance(job, EventDelivery):
                     self._deliver_event(job)
                 else:
-                    self._deliver_monitoring(job)
+                    self._deliver_monitoring(job, with_image)
         except Exception as exc:
             logger.exception("Background delivery failed: %s", type(exc).__name__)
             if job is not None:
@@ -293,8 +310,8 @@ class DeliveryQueue:
             self.offline_queue.mark_failed_attempt(item.id)
             break
 
-    def _deliver_monitoring(self, job: MonitoringDelivery) -> None:
-        jpeg = self._encode_monitoring(job.snapshot)
+    def _deliver_monitoring(self, job: MonitoringDelivery, with_image: bool = True) -> None:
+        jpeg = self._encode_monitoring(job.snapshot) if with_image else None
         image_key = self._upload(
             jpeg, job.training_session_id, job.cctv_code, "MONITORING",
             job.event_id, job.summary.captured_at_ms,

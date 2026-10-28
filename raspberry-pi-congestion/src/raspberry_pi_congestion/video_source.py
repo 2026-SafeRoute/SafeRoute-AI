@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Iterator, Optional
@@ -158,22 +159,88 @@ class RtspStreamLostError(RuntimeError):
 
 
 class RtspVideoSource(VideoSource):
+    """RTSP 스트림을 읽는다.
+
+    latest_frame_only가 켜져 있으면 읽기 스레드가 스트림을 계속 비우면서 가장 최신
+    프레임 한 장만 남긴다. 추론이 카메라 FPS보다 느려도 못 읽은 프레임이 OpenCV/FFmpeg
+    버퍼에 쌓이지 않으므로 화면과 집계가 과거로 밀리지 않는다.
+    """
+
+    # close()가 읽기 스레드 종료를 기다리는 최대 시간
+    reader_join_timeout_sec = 5.0
+
     def __init__(self, url: str, max_reconnects: int = 5, base_delay_sec: float = 1.0,
                  max_delay_sec: float = 30.0, capture_factory: Optional[Callable] = None,
-                 sleeper: Callable[[float], None] = time.sleep) -> None:
+                 sleeper: Optional[Callable[[float], None]] = None,
+                 latest_frame_only: bool = True) -> None:
         if max_reconnects < 0:
             raise ValueError("max_reconnects must not be negative")
         self.url = url
         self.max_reconnects = max_reconnects
         self.base_delay_sec = base_delay_sec
         self.max_delay_sec = max_delay_sec
+        self.latest_frame_only = latest_frame_only
         self._capture_factory = capture_factory or _opencv_capture
-        self._sleep = sleeper
+        self._stop = threading.Event()
+        # 기본 대기는 close()가 부르면 바로 깨어나도록 stop 이벤트로 기다린다.
+        self._sleep = sleeper or self._stop.wait
+        self._condition = threading.Condition()
+        self._latest_frame: object = None
+        self._latest_seq = 0
+        self._delivered_seq = 0
+        self._reader: Optional[threading.Thread] = None
+        self._reader_done = False
+        self._reader_error: Optional[Exception] = None
         self._cap = self._capture_factory(url)
 
     def frames(self) -> Iterator[object]:
+        if not self.latest_frame_only:
+            yield from self._read_sequentially()
+            return
+        self._start_reader()
+        while True:
+            with self._condition:
+                while (self._latest_seq <= self._delivered_seq and not self._reader_done
+                       and not self._stop.is_set()):
+                    self._condition.wait()
+                if self._latest_seq > self._delivered_seq:
+                    # 밀린 프레임은 이미 덮어써졌으므로 지금 남은 최신 프레임만 넘긴다.
+                    self._delivered_seq = self._latest_seq
+                    frame = self._latest_frame
+                elif self._reader_error is not None:
+                    raise self._reader_error
+                else:
+                    return
+            yield frame
+
+    def _start_reader(self) -> None:
+        if self._reader is not None:
+            return
+        self._reader = threading.Thread(target=self._read_latest, name="rtsp-reader", daemon=True)
+        self._reader.start()
+
+    def _read_latest(self) -> None:
+        try:
+            for frame in self._read_sequentially():
+                with self._condition:
+                    self._latest_frame = frame
+                    self._latest_seq += 1
+                    self._condition.notify_all()
+        except Exception as exc:  # 스레드 밖 frames()에서 다시 던져야 감독자가 재시작한다.
+            with self._condition:
+                self._reader_error = exc
+        finally:
+            # read()가 블로킹 중일 수 있으므로 캡처 해제는 읽기 스레드에서만 한다.
+            if self._cap is not None:
+                self._cap.release()
+                self._cap = None
+            with self._condition:
+                self._reader_done = True
+                self._condition.notify_all()
+
+    def _read_sequentially(self) -> Iterator[object]:
         reconnects = 0
-        while self._cap is not None:
+        while self._cap is not None and not self._stop.is_set():
             ok, frame = self._cap.read() if self._cap.isOpened() else (False, None)
             if ok:
                 reconnects = 0
@@ -186,10 +253,21 @@ class RtspVideoSource(VideoSource):
             reconnects += 1
             logger.warning("RTSP read failed; reconnect %d/%d in %.1fs", reconnects, self.max_reconnects, delay)
             self._sleep(delay)
+            if self._stop.is_set():
+                return
             self._cap.release()
             self._cap = self._capture_factory(self.url)
 
     def close(self) -> None:
+        self._stop.set()
+        with self._condition:
+            self._condition.notify_all()
+        reader = self._reader
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(self.reader_join_timeout_sec)
+        if reader is not None and reader.is_alive():
+            logger.warning("RTSP reader did not stop within %.1fs", self.reader_join_timeout_sec)
+            return
         if self._cap is not None:
             self._cap.release()
             self._cap = None

@@ -1,4 +1,7 @@
 import math
+import queue
+import threading
+import time
 
 import pytest
 
@@ -241,3 +244,84 @@ def test_rtsp_reconnect_limit_and_backoff():
     assert sleeps == [.5, 1.0]
     assert len(captures) == 3
     source.close()
+
+
+class BlockingCapture:
+    """큐에 넣은 프레임이 올 때까지 read()가 블로킹되는 RTSP 캡처 대역. None을 넣으면 읽기 실패다."""
+
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.read_calls = 0
+        self.released = threading.Event()
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        self.read_calls += 1
+        frame = self.queue.get(timeout=5)
+        return (False, None) if frame is None else (True, frame)
+
+    def release(self):
+        self.released.set()
+
+
+def wait_until(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not met in time"
+        time.sleep(0.005)
+
+
+def close_blocking_source(source, cap):
+    # 읽기 실패를 넣어 블로킹된 read()를 풀어야 close()가 읽기 스레드를 바로 거둔다.
+    cap.queue.put(None)
+    source.close()
+    assert cap.released.is_set()
+
+
+def test_rtsp_yields_only_latest_frame_when_consumer_is_slow():
+    cap = BlockingCapture()
+    source = RtspVideoSource("rtsp://camera/stream", max_reconnects=0, capture_factory=lambda _: cap)
+    frames = source.frames()
+
+    cap.queue.put(1)
+    assert next(frames) == 1
+    for frame in (2, 3, 4):
+        cap.queue.put(frame)
+    # 다섯 번째 read()에 들어갔다면 4까지 읽어서 최신 프레임으로 남긴 상태다.
+    wait_until(lambda: cap.read_calls >= 5)
+    assert next(frames) == 4
+    close_blocking_source(source, cap)
+
+
+def test_rtsp_does_not_yield_same_frame_twice():
+    cap = BlockingCapture()
+    source = RtspVideoSource("rtsp://camera/stream", max_reconnects=0, capture_factory=lambda _: cap)
+    frames = source.frames()
+    cap.queue.put("first")
+    assert next(frames) == "first"
+
+    received = []
+    consumer = threading.Thread(target=lambda: received.append(next(frames)))
+    consumer.start()
+    consumer.join(0.2)
+    assert consumer.is_alive() and received == []
+
+    cap.queue.put("second")
+    consumer.join(2)
+    assert received == ["second"]
+    close_blocking_source(source, cap)
+
+
+def test_rtsp_sequential_mode_yields_every_frame_then_raises():
+    cap = Capture([1, 2, 3])
+    source = RtspVideoSource("rtsp://camera/stream", max_reconnects=0,
+                             capture_factory=lambda _: cap, latest_frame_only=False)
+    received = []
+    with pytest.raises(RtspStreamLostError):
+        for frame in source.frames():
+            received.append(frame)
+    assert received == [1, 2, 3]
+    source.close()
+    assert cap.released

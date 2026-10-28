@@ -48,7 +48,9 @@ class DeliveryQueue:
     unencoded until a worker handles them.
 
     Monitoring snapshots are only for live congestion monitoring, so they are
-    downscaled and encoded at a lower JPEG quality to shorten the S3 PUT.
+    downscaled and encoded at a lower JPEG quality to shorten the S3 PUT. When a
+    newer snapshot is already waiting, an older one is reported without its image
+    so uploads never fall behind the live feed; the headcounts are still sent.
     Congestion event images are evidence and keep the original resolution.
     """
 
@@ -207,15 +209,18 @@ class DeliveryQueue:
                 if self._stop:
                     return
                 job = self._monitoring.popleft()
+                # 더 새 스냅샷이 기다리고 있으면 이 관측값은 이미지 없이 인원만 보낸다.
+                # 화면에는 어차피 더 새 이미지가 뜨므로 업로드가 밀려 화면이 과거가 되지 않는다.
+                with_image = not self._monitoring
                 self._begin(job)
-            self._execute(job)
+            self._execute(job, with_image)
 
     def _begin(self, job) -> None:
         self._inflight[threading.get_ident()] = (
             self._job_session(job) if job is not None else self._active_session_id
         )
 
-    def _execute(self, job) -> None:
+    def _execute(self, job, with_image: bool = True) -> None:
         try:
             if job is None:
                 self._flush_offline()
@@ -223,7 +228,7 @@ class DeliveryQueue:
                 if isinstance(job, EventDelivery):
                     self._deliver_event(job)
                 else:
-                    self._deliver_monitoring(job)
+                    self._deliver_monitoring(job, with_image)
         except Exception as exc:
             logger.exception("Background delivery failed: %s", type(exc).__name__)
             if job is not None:
@@ -293,8 +298,8 @@ class DeliveryQueue:
             self.offline_queue.mark_failed_attempt(item.id)
             break
 
-    def _deliver_monitoring(self, job: MonitoringDelivery) -> None:
-        jpeg = self._encode_monitoring(job.snapshot)
+    def _deliver_monitoring(self, job: MonitoringDelivery, with_image: bool = True) -> None:
+        jpeg = self._encode_monitoring(job.snapshot) if with_image else None
         image_key = self._upload(
             jpeg, job.training_session_id, job.cctv_code, "MONITORING",
             job.event_id, job.summary.captured_at_ms,

@@ -1,4 +1,5 @@
 import threading
+import time
 
 import numpy as np
 
@@ -132,6 +133,11 @@ def test_monitoring_snapshots_are_delivered_by_parallel_workers():
     queue.set_session(SESSION)
 
     assert queue.submit_monitoring(monitoring("first"))
+    # 기다리는 더 새 스냅샷이 있으면 이미지를 건너뛰므로, 첫 작업을 워커가 가져간 뒤에 넣는다.
+    deadline = time.monotonic() + 2
+    while queue.pending_count:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
     assert queue.submit_monitoring(monitoring("second"))
 
     assert queue.wait_idle()
@@ -360,4 +366,48 @@ def test_monitoring_snapshot_is_downscaled_but_event_evidence_keeps_original_res
     assert decode(monitoring_jpeg).shape == (240, 640, 3)
     assert decode(event_jpeg).shape == (480, 1280, 3)
     assert len(monitoring_jpeg) * 4 < len(event_jpeg)
+    queue.close()
+
+
+class BlockingUploadClient(UploadRecordingClient):
+    """첫 업로드에서 멈춰 그 사이에 스냅샷이 쌓이게 하는 클라이언트."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.uploaded_ids = []
+
+    def request_image_upload(self, **kwargs):
+        self.uploaded_ids.append(kwargs["reference_id"])
+        return {"objectKey": kwargs["reference_id"], "uploadUrl": kwargs["reference_id"],
+                "expiresAt": 2 ** 62}
+
+    def upload_jpeg(self, upload_url, jpeg):
+        if not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(2)
+        return True
+
+
+def test_backlogged_monitoring_snapshots_report_headcount_without_image():
+    client = BlockingUploadClient()
+    queue = DeliveryQueue(client, PassthroughRenderer(), monitoring_workers=1)
+    queue.set_session(SESSION)
+
+    assert queue.submit_monitoring(monitoring("active"))
+    assert client.entered.wait(1)
+    for event_id in ("old", "older-than-newest", "newest"):
+        assert queue.submit_monitoring(monitoring(event_id))
+
+    client.release.set()
+    assert queue.wait_idle()
+    # 밀린 관측값도 인원은 모두 보내지만 이미지는 가장 최신 것만 올린다.
+    assert [o.event_id for o in client.observations] == [
+        "active", "old", "older-than-newest", "newest",
+    ]
+    assert client.uploaded_ids == ["active", "newest"]
+    assert [o.monitoring_image_key for o in client.observations] == [
+        "active", None, None, "newest",
+    ]
     queue.close()

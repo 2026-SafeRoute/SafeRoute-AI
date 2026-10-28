@@ -1,4 +1,5 @@
 import math
+import threading
 
 import pytest
 
@@ -240,4 +241,54 @@ def test_rtsp_reconnect_limit_and_backoff():
         list(source.frames())
     assert sleeps == [.5, 1.0]
     assert len(captures) == 3
+    source.close()
+
+
+class SlowConsumerCapture(Capture):
+    """프레임 0..n-1을 내보내고, 소비자가 따라올 때까지 끝을 알리지 않는다."""
+
+    def __init__(self, count):
+        super().__init__(range(count))
+        self.initial_count = count
+        self.drained = threading.Event()
+        self.consumer_busy = threading.Event()
+
+    def read(self):
+        if len(self.frames) < self.initial_count:
+            # 첫 프레임을 소비자가 받아 간 뒤에야 나머지를 읽는다(소비자가 추론 중인 상황).
+            assert self.consumer_busy.wait(2)
+        if self.frames:
+            return True, self.frames.pop(0)
+        self.drained.set()
+        return False, None
+
+
+def test_rtsp_latest_only_skips_frames_buffered_while_consumer_was_busy():
+    capture = SlowConsumerCapture(50)
+    source = RtspVideoSource("rtsp://camera/stream", max_reconnects=0,
+                             capture_factory=lambda _: capture, sleeper=lambda _: None)
+    frames = source.frames()
+    first = next(frames)
+    capture.consumer_busy.set()
+    # 소비자가 첫 프레임을 처리하는 동안 리더 스레드가 나머지를 전부 읽어 버린다.
+    assert capture.drained.wait(2)
+    received = [first]
+    with pytest.raises(RtspStreamLostError):
+        for frame in frames:
+            received.append(frame)
+    # 밀린 프레임을 순서대로 받는 대신 곧바로 최신 프레임을 받는다.
+    assert received == [0, 49]
+    assert source.dropped_frames == 48
+    source.close()
+
+
+def test_rtsp_sequential_mode_keeps_every_frame():
+    capture = Capture(range(5))
+    source = RtspVideoSource("rtsp://camera/stream", max_reconnects=0, latest_only=False,
+                             capture_factory=lambda _: capture, sleeper=lambda _: None)
+    received = []
+    with pytest.raises(RtspStreamLostError):
+        for frame in source.frames():
+            received.append(frame)
+    assert received == [0, 1, 2, 3, 4]
     source.close()

@@ -40,7 +40,7 @@ class Client:
             "expiresAt": 10_000,
         }
 
-    def upload_jpeg(self, upload_url, jpeg):
+    def upload_jpeg(self, upload_url, jpeg, retry=True):
         return True
 
     def report_event_json(self, payload):

@@ -36,7 +36,7 @@ class ImageClient:
         self.presigned_requests.append(kwargs)
         return next(self.targets)
 
-    def upload_jpeg(self, upload_url, jpeg):
+    def upload_jpeg(self, upload_url, jpeg, retry=True):
         self.uploads.append((upload_url, jpeg))
         return next(self.upload_results)
 

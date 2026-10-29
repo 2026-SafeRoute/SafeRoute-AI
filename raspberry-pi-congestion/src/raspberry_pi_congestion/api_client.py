@@ -120,7 +120,7 @@ class SafeRouteDeviceClient(CongestionReporter):
 
     def request_image_upload(self, *, training_session_id: str, cctv_code: str,
                              image_type: str, reference_id: str,
-                             captured_at: int) -> Optional[dict]:
+                             captured_at: int, retry: bool = True) -> Optional[dict]:
         payload = {
             "requestId": str(uuid.uuid4()),
             "trainingSessionId": training_session_id,
@@ -130,7 +130,8 @@ class SafeRouteDeviceClient(CongestionReporter):
             "capturedAt": captured_at,
             "contentType": "image/jpeg",
         }
-        response = self._send("POST", self.PRESIGNED_PATH, json=payload)
+        response = self._send("POST", self.PRESIGNED_PATH, json=payload,
+                              max_retries=None if retry else 0)
         if response is None:
             return None
         try:
@@ -140,9 +141,10 @@ class SafeRouteDeviceClient(CongestionReporter):
             logger.error("Invalid presigned URL response")
             return None
 
-    def upload_jpeg(self, upload_url: str, jpeg: bytes) -> ImageUploadResult:
+    def upload_jpeg(self, upload_url: str, jpeg: bytes, retry: bool = True) -> ImageUploadResult:
         request = self._request_fn()
-        for attempt in range(self.max_retries + 1):
+        max_retries = self.max_retries if retry else 0
+        for attempt in range(max_retries + 1):
             try:
                 response = request(
                     "PUT",
@@ -161,7 +163,7 @@ class SafeRouteDeviceClient(CongestionReporter):
                     return ImageUploadResult.FAILED
             except Exception as exc:
                 logger.warning("Image upload failed: %s", type(exc).__name__)
-            if attempt >= self.max_retries:
+            if attempt >= max_retries:
                 return ImageUploadResult.FAILED
             self._sleep(self.backoff_base_sec * (2 ** attempt))
         return ImageUploadResult.FAILED
@@ -200,17 +202,25 @@ class SafeRouteDeviceClient(CongestionReporter):
     def _request_fn(self) -> Callable:
         if self._request is not None:
             return self._request
-        import requests
-        return requests.request
+        # 요청마다 TCP/TLS 연결을 새로 맺으면 Pi에서 요청 하나에 수백 ms씩 더 든다.
+        # 스레드마다 Session을 하나씩 두고 연결을 재사용한다(Session은 스레드 간 공유가 안전하지 않다).
+        session = getattr(self._request_state, "session", None)
+        if session is None:
+            import requests
+            session = requests.Session()
+            self._request_state.session = session
+        return session.request
 
     def _send(self, method: str, path: str, **kwargs):
         request = self._request_fn()
         url = f"{self.base_url}/{path.lstrip('/')}"
         headers = {**self.auth.headers(), **kwargs.pop("headers", {})}
         retry_statuses = kwargs.pop("retry_statuses", set())
+        max_retries = kwargs.pop("max_retries", None)
+        max_retries = self.max_retries if max_retries is None else max_retries
         if "json" in kwargs:
             headers["Content-Type"] = "application/json"
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(max_retries + 1):
             try:
                 response = request(method, url, headers=headers,
                                    timeout=(self.timeout_sec, self.timeout_sec), **kwargs)
@@ -227,7 +237,7 @@ class SafeRouteDeviceClient(CongestionReporter):
                     return None
             except Exception as exc:
                 logger.warning("Device API %s %s failed: %s", method, path, type(exc).__name__)
-            if attempt >= self.max_retries:
+            if attempt >= max_retries:
                 self._request_state.retryable = True
                 return None
             self._sleep(self.backoff_base_sec * (2 ** attempt))

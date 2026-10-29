@@ -300,9 +300,11 @@ class DeliveryQueue:
 
     def _deliver_monitoring(self, job: MonitoringDelivery, with_image: bool = True) -> None:
         jpeg = self._encode_monitoring(job.snapshot) if with_image else None
+        # 모니터링 이미지는 늦게 올라가면 화면에 쓸모가 없으므로 재시도하지 않는다. 실패하면 인원만 보내고
+        # 다음 스냅샷을 올린다 - 재시도로 워커가 수십 초 묶이면 그동안 화면이 멈춘다.
         image_key = self._upload(
             jpeg, job.training_session_id, job.cctv_code, "MONITORING",
-            job.event_id, job.summary.captured_at_ms,
+            job.event_id, job.summary.captured_at_ms, retry=False,
         ) if jpeg is not None else None
         if not self._session_active(job.training_session_id):
             return
@@ -350,7 +352,8 @@ class DeliveryQueue:
                 )
 
     def _upload(self, jpeg: bytes, session_id: str, cctv_code: str,
-                image_type: str, reference_id: str, captured_at: int) -> Optional[str]:
+                image_type: str, reference_id: str, captured_at: int,
+                retry: bool = True) -> Optional[str]:
         if not hasattr(self.client, "request_image_upload"):
             return None
         for _ in range(self.max_presigned_refreshes + 1):
@@ -359,7 +362,7 @@ class DeliveryQueue:
             target = self.client.request_image_upload(
                 training_session_id=session_id, cctv_code=cctv_code,
                 image_type=image_type, reference_id=reference_id,
-                captured_at=captured_at,
+                captured_at=captured_at, retry=retry,
             )
             if target is None:
                 return None
@@ -367,7 +370,7 @@ class DeliveryQueue:
                 continue
             if not self._session_active(session_id):
                 return None
-            result = self.client.upload_jpeg(target["uploadUrl"], jpeg)
+            result = self.client.upload_jpeg(target["uploadUrl"], jpeg, retry=retry)
             if result is True or result == ImageUploadResult.SUCCESS:
                 return target["objectKey"]
             if result != ImageUploadResult.EXPIRED:

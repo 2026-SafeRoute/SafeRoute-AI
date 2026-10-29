@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from raspberry_pi_congestion.api_client import (
@@ -295,3 +297,44 @@ def test_inactive_config_rejects_non_positive_runtime_values(field):
 
     with pytest.raises(ValueError, match="snapshot interval and target FPS"):
         DeviceCongestionConfig.from_json(payload)
+
+
+def test_monitoring_upload_without_retry_tries_once():
+    calls = []
+    client = SafeRouteDeviceClient(
+        "http://server", AuthHeaderProvider("token"), max_retries=2,
+        request=lambda *a, **k: calls.append(a) or Response(503),
+        sleeper=lambda _: pytest.fail("must not back off"),
+    )
+
+    assert client.upload_jpeg("https://s3.example.com/signed", b"jpeg", retry=False) == ImageUploadResult.FAILED
+    assert client.request_image_upload(
+        training_session_id="session", cctv_code="CCTV_001", image_type="MONITORING",
+        reference_id="event-1", captured_at=1000, retry=False,
+    ) is None
+    assert len(calls) == 2
+
+
+def test_requests_reuse_one_session_per_thread(monkeypatch):
+    import requests
+
+    created = []
+
+    class FakeSession:
+        def __init__(self):
+            created.append(self)
+
+        def request(self, *args, **kwargs):
+            return Response(200, {"commands": []})
+
+    monkeypatch.setattr(requests, "Session", FakeSession)
+    client = SafeRouteDeviceClient("http://server", AuthHeaderProvider("token"))
+
+    client.fetch_light_commands("CCTV_001")
+    client.fetch_light_commands("CCTV_001")
+    assert len(created) == 1
+
+    worker = threading.Thread(target=lambda: client.fetch_light_commands("CCTV_001"))
+    worker.start()
+    worker.join()
+    assert len(created) == 2

@@ -335,7 +335,7 @@ class UploadRecordingClient(Client):
         image_type = kwargs["image_type"]
         return {"objectKey": image_type, "uploadUrl": image_type, "expiresAt": 2 ** 62}
 
-    def upload_jpeg(self, upload_url, jpeg):
+    def upload_jpeg(self, upload_url, jpeg, retry=True):
         self.uploads[upload_url] = jpeg
         return True
 
@@ -383,7 +383,7 @@ class BlockingUploadClient(UploadRecordingClient):
         return {"objectKey": kwargs["reference_id"], "uploadUrl": kwargs["reference_id"],
                 "expiresAt": 2 ** 62}
 
-    def upload_jpeg(self, upload_url, jpeg):
+    def upload_jpeg(self, upload_url, jpeg, retry=True):
         if not self.entered.is_set():
             self.entered.set()
             assert self.release.wait(2)
@@ -410,4 +410,34 @@ def test_backlogged_monitoring_snapshots_report_headcount_without_image():
     assert [o.monitoring_image_key for o in client.observations] == [
         "active", None, None, "newest",
     ]
+    queue.close()
+
+
+class RetryRecordingClient(UploadRecordingClient):
+    def __init__(self):
+        super().__init__()
+        self.retries = {}
+
+    def request_image_upload(self, **kwargs):
+        self.retries.setdefault(kwargs["image_type"], []).append(kwargs["retry"])
+        return super().request_image_upload(**kwargs)
+
+    def upload_jpeg(self, upload_url, jpeg, retry=True):
+        self.retries.setdefault(upload_url, []).append(retry)
+        return super().upload_jpeg(upload_url, jpeg)
+
+
+def test_monitoring_images_are_not_retried_but_event_evidence_is():
+    client = RetryRecordingClient()
+    queue = DeliveryQueue(client, PassthroughRenderer(), monitoring_workers=1)
+    queue.set_session(SESSION)
+
+    assert queue.submit_monitoring(monitoring("monitoring"))
+    assert queue.submit_event(event("event"))
+    assert queue.wait_idle()
+    # request_image_upload와 upload_jpeg가 이미지 종류마다 한 번씩 불린다.
+    assert client.retries == {
+        "MONITORING": [False, False],
+        "CONGESTION_EVENT": [True, True],
+    }
     queue.close()
